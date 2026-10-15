@@ -34,12 +34,56 @@ export type PeekPicture = {
   note?: string
   /** Counts up with every picture shown, so a redraw never reuses an old one. */
   generation: number
-  /** PROTOTYPE (native-text): the page read as terminal text, for `/peek <page> --text`. */
+  /** PROTOTYPE (native-text): the page read as terminal text, for `/peek <page> --text` or `--live`. */
   text?: PeekText
+  /** PROTOTYPE (live text): the page kept open in a headless Chrome, for `/peek <page> --live`. */
+  live?: PeekLive
 }
 
-/** PROTOTYPE (native-text): one piece of a page shown as text: markdown, or a figure by its index. */
-export type PeekPiece = { markdown: string } | { figure: number }
+/** PROTOTYPE (native-text): one piece of a page shown as text: markdown, a figure by its index, or a row of text and controls. */
+export type PeekPiece = { markdown: string } | { figure: number } | { row: PeekRowItem[] }
+
+/** PROTOTYPE (native-text): a run of text: bold, italic, code, a link. */
+export type PeekRun = { x: string; b?: 1; i?: 1; c?: 1; a?: string }
+
+/** PROTOTYPE (live text): one item of a row: text, or a control by its index. */
+export type PeekRowItem = { text: PeekRun[] } | { control: number }
+
+/** PROTOTYPE (live text): a control of the page, drawn as the terminal's own. */
+export type PeekControl = {
+  /** The page's address for it: its data-peek-id. */
+  id: string
+  k: 'button' | 'check' | 'radio' | 'text' | 'select' | 'range'
+  /** What it says. */
+  l: string
+  /** A field's text, the option picked, a slider's number. */
+  v?: string
+  /** Checked, selected or pressed. */
+  on?: boolean
+  /** Disabled. */
+  off?: 1
+  /** A select's options. */
+  opts?: { v: string; l: string }[]
+  /** A field's placeholder. */
+  ph?: string
+  min?: string
+  max?: string
+  step?: string
+  /** A field of several lines, which Enter does not submit. */
+  area?: 1
+}
+
+/** PROTOTYPE (live text): where a live page is open, and how to open it again. */
+export type PeekLive = {
+  /** The page's number in the helper, and the helper's socket: a reload starts a new helper. */
+  page: string
+  socket: string
+  file: string
+  width: number
+  scale: number
+  dir: string
+  browser: string
+}
 
 /** PROTOTYPE (native-text): a figure of the page, cut from a snapshot of it where that worked. */
 export type PeekFigure = {
@@ -57,10 +101,14 @@ export type PeekFigure = {
 export type PeekSection = { title: string; pieces: PeekPiece[] }
 
 /** PROTOTYPE (native-text): a page as text: what comes before its first heading, then its sections. */
-export type PeekText = { intro: PeekPiece[]; sections: PeekSection[]; figures: PeekFigure[] }
+export type PeekText = { intro: PeekPiece[]; sections: PeekSection[]; figures: PeekFigure[]; controls?: PeekControl[] }
 
-/** PROTOTYPE (native-text): how a row shows its text: the layout picked, open sections, the tab shown. */
-export type PeekView = { variant: number; open: number[]; tab: number }
+/**
+ * PROTOTYPE (native-text): how a row shows its text: the layout picked, open
+ * sections, the tab shown; for a live page, whether a press is under way and
+ * what the last one said.
+ */
+export type PeekView = { variant: number; open: number[]; tab: number; busy?: boolean; error?: string; notice?: string }
 
 declare module 'claude-code' {
   interface PluginState {

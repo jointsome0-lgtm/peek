@@ -1,19 +1,20 @@
 // PROTOTYPE (native-text branch, throwaway). A page shown in the chat as real
 // terminal text instead of one big picture: headings, paragraphs, lists,
 // tables and code drawn by the engine's Markdown element, figures cut from a
-// snapshot of the page.
+// snapshot of the page; with --live, the page's own controls drawn as the
+// terminal's buttons, fields and lists, working in a page kept open.
 //
 // Question: does a page read well in the chat as text, and which layout feels
 // right: Outline (folded sections), Document (all of it) or Tabs (one section
-// at a time)?
+// at a time)? With --live: does using the page from the chat feel right?
 //
-// Run: /peek <page.html> --text, unfold the row, flip layouts with ◂ and ▸.
+// Run: /peek <page.html> --text (or --live), unfold the row, flip layouts with ◂ and ▸.
 // This file never merges; the decision lands on main, rewritten with tests.
 
 import { atom, memberOf, read, update } from 'claude-code'
 import type { EngineInterface, RenderInput } from 'claude-code'
 
-import type { PeekFigure, PeekPicture, PeekPiece, PeekText, PeekView } from '../types'
+import type { PeekControl, PeekFigure, PeekPicture, PeekPiece, PeekRowItem, PeekRun, PeekText, PeekView } from '../types'
 import { fromBase64 } from './base64'
 import { fitCells } from './picture'
 
@@ -22,7 +23,8 @@ const viewAtom = atom({ plugin: 'peek', key: 'view' } as const, { variant: 0, op
 const MAX_IMAGE = 255
 const LINKABLE = /^(https?|file):/i
 
-type Run = { x: string; b?: 1; i?: 1; c?: 1; a?: string }
+type Run = PeekRun
+type RowItem = { r: Run[] } | { k: number }
 export type FigureBox = { x: number; y: number; w: number; h: number }
 type Block =
   | { t: 'p'; r: Run[] }
@@ -34,29 +36,41 @@ type Block =
   | { t: 'hr' }
   | { t: 'quote'; b: Block[] }
   | { t: 'details'; s: Run[]; b: Block[]; open: boolean }
+  | { t: 'row'; items: RowItem[] }
   | ({ t: 'fig'; alt: string } & FigureBox)
-type Extracted = { title: string; size: [number, number]; blocks: Block[] }
+/** The page as the reader read it. */
+export type Extracted = { title: string; size: [number, number]; blocks: Block[]; controls?: PeekControl[] }
+/** PROTOTYPE (live text): what a press in the chat asks of the live page. */
+export type LiveAction =
+  | { kind: 'read' }
+  | { kind: 'click' | 'text' | 'select' | 'range'; control: string; value?: string }
 
-// Runs in the page once it has loaded, and again late in the browser's time
-// budget: walks the DOM into blocks of styled runs and puts them, as base64
-// of ASCII JSON, in data-peek-text on the root, which --dump-dom prints first.
-export const EXTRACT_SCRIPT =
-  '<script>' +
-  String.raw`(() => {
+// Peek's page reader, plain JavaScript run inside the page: walks the DOM into
+// blocks of styled runs, figures with their boxes, and rows that hold the
+// page's controls (buttons, fields, lists, boxes to tick), each marked with a
+// data-peek-id so a press in the chat can find it again. `read()` returns
+// { title, size, blocks, controls }. No backticks or dollar-braces inside.
+const READER = String.raw`
   const PHRASING = new Set('A ABBR B BDI BDO BIG BR BUTTON CITE CODE DATA DEL DFN EM FONT I IMG INPUT INS KBD LABEL MARK METER NOBR OUTPUT PROGRESS Q S SAMP SELECT SMALL SPAN STRIKE STRONG SUB SUP SVG TEXTAREA TIME TT U VAR WBR'.split(' '));
   const SKIP = new Set('SCRIPT STYLE NOSCRIPT TEMPLATE HEAD META LINK TITLE BASE DATALIST'.split(' '));
   const FIGURES = new Set('IMG SVG CANVAS VIDEO PICTURE IFRAME OBJECT EMBED'.split(' '));
+  const ROLES = new Set('button checkbox radio switch tab menuitem menuitemcheckbox menuitemradio option'.split(' '));
   const BLOCKS = 'address,article,aside,blockquote,details,dialog,div,dl,fieldset,figure,footer,form,h1,h2,h3,h4,h5,h6,header,hr,li,main,nav,ol,p,pre,section,table,ul';
+  const CONTROLS = 'button,input,select,textarea,[role=button],[role=checkbox],[role=radio],[role=switch],[role=tab],[role=option],[role^=menuitem]';
   const MONO = /mono|courier|consol|menlo|monaco/i;
   const MIN_FIGURE = 48;
+  const JOINER = ' \u2014 ';
+  let controls = [];
+  let consumed = new Set();
   const tagOf = n => n.localName.toUpperCase();
   const css = n => getComputedStyle(n);
+  const words = text => String(text || '').replace(/\s+/g, ' ').trim();
   const isHidden = (n, s) => s.display === 'none' || s.visibility === 'hidden' || s.visibility === 'collapse' || s.opacity === '0' || n.getAttribute('aria-hidden') === 'true';
   const isFigure = n => FIGURES.has(tagOf(n)) || n.getAttribute('role') === 'img';
   const isPhrasing = n => PHRASING.has(tagOf(n)) && !n.querySelector(BLOCKS);
   const altOf = n => {
     const title = n.querySelector('title');
-    return (n.getAttribute('aria-label') || n.getAttribute('alt') || n.getAttribute('title') || (title ? title.textContent : '') || '').replace(/\s+/g, ' ').trim();
+    return words(n.getAttribute('aria-label') || n.getAttribute('alt') || n.getAttribute('title') || (title ? title.textContent : ''));
   };
   const figureOf = n => {
     const r = n.getBoundingClientRect();
@@ -76,6 +90,112 @@ export const EXTRACT_SCRIPT =
     }
     return g;
   };
+  // Click listeners are only visible to DevTools' own functions, which the
+  // live view's reader has and a --dump-dom one does not.
+  const listens = n => {
+    if (typeof getEventListeners !== 'function') return false;
+    try {
+      const l = getEventListeners(n);
+      return !!(l.click || l.mousedown || l.mouseup || l.pointerdown || l.pointerup);
+    } catch (error) {
+      return false;
+    }
+  };
+  const small = n => {
+    const text = words(n.innerText);
+    return text.length > 0 && text.length <= 80 && !n.querySelector(BLOCKS) && !n.querySelector(CONTROLS);
+  };
+  const anchored = href => {
+    try {
+      return !!document.getElementById(decodeURIComponent(href.slice(1)));
+    } catch (error) {
+      return false;
+    }
+  };
+  // A control: a form field or button, something with a control's role or an
+  // onclick, or a short piece of text that listens for clicks or shows the
+  // pointer hand. A link that goes somewhere stays a link; a big figure stays a
+  // figure.
+  const isControl = (n, s) => {
+    const tag = tagOf(n);
+    if (tag === 'LABEL' || tag === 'SUMMARY' || tag === 'OPTION' || tag === 'OPTGROUP') return false;
+    if (tag === 'BUTTON' || tag === 'SELECT' || tag === 'TEXTAREA') return true;
+    if (tag === 'INPUT') return n.type !== 'hidden' && n.type !== 'file';
+    if (isFigure(n)) {
+      const r = n.getBoundingClientRect();
+      if (r.width >= MIN_FIGURE && r.height >= MIN_FIGURE) return false;
+    }
+    if (tag === 'A' && n.hasAttribute('href')) {
+      const href = n.getAttribute('href').trim();
+      if (!/^(#|javascript:|$)/i.test(href) || (href.length > 1 && href[0] === '#' && anchored(href))) return false;
+    }
+    if (ROLES.has(n.getAttribute('role') || '') || n.hasAttribute('onclick')) return !n.querySelector(CONTROLS);
+    const pointer = s.cursor === 'pointer' && !(n.parentElement && css(n.parentElement).cursor === 'pointer');
+    return (pointer || listens(n)) && small(n);
+  };
+  const labelOf = (n, k) => {
+    const aria = n.getAttribute('aria-label') || '';
+    const title = n.getAttribute('title') || '';
+    const label = n.labels && n.labels.length ? n.labels[0].innerText : '';
+    if (k === 'button') {
+      const value = tagOf(n) === 'INPUT' ? n.value || (n.type === 'submit' ? 'Submit' : n.type === 'reset' ? 'Reset' : '') : '';
+      return words(n.innerText) || aria || value || title || altOf(n) || 'button';
+    }
+    if (k === 'check' || k === 'radio') return words(label) || aria || title || (n.value && n.value !== 'on' ? n.value : '') || words(n.innerText);
+    return aria || words(label) || n.getAttribute('placeholder') || n.getAttribute('name') || title || '';
+  };
+  const controlOf = n => {
+    if (!n.hasAttribute('data-peek-id')) {
+      window.__peekSeq = (window.__peekSeq || 0) + 1;
+      n.setAttribute('data-peek-id', String(window.__peekSeq));
+    }
+    const tag = tagOf(n);
+    const role = n.getAttribute('role') || '';
+    const type = tag === 'INPUT' ? String(n.type || 'text').toLowerCase() : '';
+    const c = { id: n.getAttribute('data-peek-id') };
+    if (type === 'checkbox' || role === 'checkbox' || role === 'switch' || role === 'menuitemcheckbox') {
+      c.k = 'check';
+      c.on = type === 'checkbox' ? n.checked : n.getAttribute('aria-checked') === 'true';
+    } else if (type === 'radio' || role === 'radio' || role === 'menuitemradio') {
+      c.k = 'radio';
+      c.on = type === 'radio' ? n.checked : n.getAttribute('aria-checked') === 'true';
+    } else if (tag === 'SELECT') {
+      c.k = 'select';
+      c.v = n.value;
+      c.opts = [...n.options].filter(o => !o.hidden && !o.disabled).map(o => ({ v: o.value, l: words(o.label || o.text) || o.value }));
+    } else if (type === 'range') {
+      c.k = 'range';
+      c.v = n.value;
+      c.min = n.min || '0';
+      c.max = n.max || '100';
+      c.step = n.step && n.step !== 'any' ? n.step : '1';
+    } else if (tag === 'TEXTAREA' || (tag === 'INPUT' && !/^(button|submit|reset|image)$/.test(type))) {
+      c.k = 'text';
+      c.v = n.value;
+      if (n.placeholder) c.ph = n.placeholder;
+      if (tag === 'TEXTAREA') c.area = 1;
+    } else {
+      c.k = 'button';
+      const state = role === 'tab' || role === 'option' ? n.getAttribute('aria-selected') : n.getAttribute('aria-pressed');
+      if (state === 'true') c.on = true;
+    }
+    if (n.disabled || n.getAttribute('aria-disabled') === 'true') c.off = 1;
+    c.l = labelOf(n, c.k).slice(0, 80);
+    controls.push(c);
+    return controls.length - 1;
+  };
+  // A control as plain text, where it cannot be drawn as one: in a heading or a table cell.
+  const flatOf = c => {
+    if (c.k === 'check') return (c.on ? '\u2611 ' : '\u2610 ') + c.l;
+    if (c.k === 'radio') return (c.on ? '\u25c9 ' : '\u25cb ') + c.l;
+    if (c.k === 'select') {
+      const picked = (c.opts || []).find(o => o.v === c.v);
+      return '[' + (picked ? picked.l : c.v) + ' \u25be]';
+    }
+    if (c.k === 'text') return '[' + (c.v || c.ph || c.l || '\u2026') + ']';
+    if (c.k === 'range') return '[' + (c.l ? c.l + ' ' : '') + c.v + ']';
+    return '[' + c.l + ']';
+  };
   const Runs = joiner => ({ list: [], sep: '', joiner });
   const sameFormat = (a, f) => a.b === f.b && a.i === f.i && a.c === f.c && a.a === f.a;
   const pushText = (runs, text, f) => {
@@ -85,13 +205,16 @@ export const EXTRACT_SCRIPT =
       if (!text.trim()) return;
       const sep = runs.sep;
       runs.sep = '';
-      if (list.some(r => r.x !== undefined && r.x.trim())) {
-        const last = list[list.length - 1];
+      // Nothing goes between a figure or a control and what follows: they stand apart anyway.
+      let k = list.length - 1;
+      while (k >= 0 && list[k].x !== undefined && !list[k].x.trim()) k--;
+      const last = list[list.length - 1];
+      if (k >= 0 && list[k].x !== undefined) {
         if (sep === 'joiner') {
-          if (last.x !== undefined) last.x = last.x.replace(/\s+$/, '');
+          last.x = last.x.replace(/\s+$/, '');
           list.push({ x: runs.joiner });
           text = text.replace(/^\s+/, '');
-        } else if (last.x !== undefined && !/\s$/.test(last.x) && !/^\s/.test(text)) {
+        } else if (!/\s$/.test(last.x) && !/^\s/.test(text)) {
           list.push({ x: ' ' });
         }
       }
@@ -99,6 +222,20 @@ export const EXTRACT_SCRIPT =
     const last = list[list.length - 1];
     if (last && last.x !== undefined && sameFormat(last, f)) last.x += text;
     else list.push(Object.assign({ x: text }, f));
+  };
+  // A box to tick or a choice owns its labels: they become its text, not the page's.
+  const pushControl = (runs, n) => {
+    const index = controlOf(n);
+    const k = controls[index].k;
+    consumed.add(n);
+    if ((k === 'check' || k === 'radio') && n.labels) for (const l of n.labels) consumed.add(l);
+    runs.sep = '';
+    runs.list.push({ ctl: index });
+  };
+  const checkOf = n => {
+    if (tagOf(n) !== 'LABEL') return null;
+    const c = n.control;
+    return c && (c.type === 'checkbox' || c.type === 'radio') && !consumed.has(c) ? c : null;
   };
   const inlineNodes = (nodes, runs, f, base) => {
     for (const n of nodes) {
@@ -110,11 +247,14 @@ export const EXTRACT_SCRIPT =
       }
       if (n.nodeType !== 1) continue;
       const tag = tagOf(n);
-      if (SKIP.has(tag)) continue;
+      if (SKIP.has(tag) || consumed.has(n)) continue;
       const s = css(n);
       if (s.display === 'contents') { inlineNodes(n.childNodes, runs, formatOf(n, s, base, f), base); continue; }
       if (isHidden(n, s)) continue;
       if (tag === 'BR') { pushText(runs, '\n', f); continue; }
+      const check = checkOf(n);
+      if (check) { consumed.add(n); pushControl(runs, check); continue; }
+      if (isControl(n, s)) { pushControl(runs, n); continue; }
       if (isFigure(n)) {
         const fig = figureOf(n);
         if (fig.w >= MIN_FIGURE && fig.h >= MIN_FIGURE) runs.list.push({ fig });
@@ -149,11 +289,29 @@ export const EXTRACT_SCRIPT =
     }
     return out;
   };
+  // Text runs become a paragraph; with a control among them, a row of text
+  // pieces and controls in page order.
   const emit = (runs, out) => {
     let segment = [];
     const flush = () => {
-      const r = tidy(segment);
-      if (r.length) out.push({ t: 'p', r });
+      if (segment.some(r => r.ctl !== undefined)) {
+        const items = [];
+        let text = [];
+        const done = () => {
+          const r = tidy(text);
+          if (r.length) items.push({ r });
+          text = [];
+        };
+        for (const r of segment) {
+          if (r.ctl === undefined) text.push(r);
+          else { done(); items.push({ k: r.ctl }); }
+        }
+        done();
+        out.push({ t: 'row', items });
+      } else {
+        const r = tidy(segment);
+        if (r.length) out.push({ t: 'p', r });
+      }
       segment = [];
     };
     for (const r of runs.list) {
@@ -166,8 +324,9 @@ export const EXTRACT_SCRIPT =
     inlineNodes(n.childNodes, runs, {}, css(n));
     const flat = [];
     for (const r of runs.list) {
-      if (!r.fig) flat.push(r);
-      else if (r.fig.alt) flat.push({ x: ' ' + r.fig.alt + ' ' });
+      if (r.fig) { if (r.fig.alt) flat.push({ x: ' ' + r.fig.alt + ' ' }); }
+      else if (r.ctl !== undefined) flat.push({ x: ' ' + flatOf(controls[r.ctl]) + ' ' });
+      else flat.push(r);
     }
     return tidy(flat);
   };
@@ -186,9 +345,11 @@ export const EXTRACT_SCRIPT =
     return border || filled;
   };
   const blocksOf = (nodes, out, base) => {
-    const kids = [...nodes].filter(n => n.nodeType === 3 || (n.nodeType === 1 && !SKIP.has(tagOf(n))));
-    let runs = Runs(' — ');
-    const flush = () => { emit(runs, out); runs = Runs(' — '); };
+    const kids = [...nodes].filter(n => n.nodeType === 3 || (n.nodeType === 1 && !SKIP.has(tagOf(n)) && !consumed.has(n)));
+    let runs = Runs(JOINER);
+    const flush = () => { emit(runs, out); runs = Runs(JOINER); };
+    // The items of a flex row stand side by side: controls among them share a row.
+    const flows = /flex$/.test(base.display) && !/^column/.test(base.flexDirection);
     if (kids.every(n => n.nodeType === 3 || isPhrasing(n))) {
       inlineNodes(kids, runs, {}, base);
       flush();
@@ -196,20 +357,30 @@ export const EXTRACT_SCRIPT =
     }
     for (const n of kids) {
       if (n.nodeType === 3) { pushText(runs, n.data.replace(/\s+/g, ' '), {}); continue; }
+      if (consumed.has(n)) continue;
       const s = css(n);
       if (s.display === 'contents') { flush(); blocksOf(n.childNodes, out, base); continue; }
       if (isHidden(n, s)) continue;
+      if (checkOf(n) || isControl(n, s)) {
+        const inline = flows || s.display.startsWith('inline');
+        if (!inline) flush();
+        inlineNodes([n], runs, {}, base);
+        if (!inline) flush();
+        continue;
+      }
       if (isFigure(n)) {
         const fig = figureOf(n);
         if (fig.w >= MIN_FIGURE && fig.h >= MIN_FIGURE) { flush(); out.push(fig); } else if (fig.alt) pushText(runs, fig.alt, {});
         continue;
       }
+      // A fieldset's legend names the choices after it, on their row.
+      if (tagOf(n) === 'LEGEND') { inlineNodes([n], runs, {}, base); continue; }
       if (isPhrasing(n)) {
-        if (s.display.startsWith('inline')) inlineNodes([n], runs, {}, base);
+        if (s.display.startsWith('inline') || (flows && n.querySelector(CONTROLS))) inlineNodes([n], runs, {}, base);
         else {
           flush();
-          const own = Runs(' — ');
-          inlineNodes(n.childNodes, own, {}, s);
+          const own = Runs(JOINER);
+          inlineNodes([n], own, {}, base);
           emit(own, out);
         }
         continue;
@@ -240,7 +411,11 @@ export const EXTRACT_SCRIPT =
         const ls = css(li);
         if (tagOf(li) !== 'LI' || isHidden(li, ls)) continue;
         const b = [];
-        blocksOf(li.childNodes, b, ls);
+        if (isControl(li, ls)) {
+          const runs = Runs(JOINER);
+          pushControl(runs, li);
+          emit(runs, b);
+        } else blocksOf(li.childNodes, b, ls);
         if (b.length) items.push(b);
       }
       if (items.length) out.push(tag === 'OL' ? { t: 'ol', start: n.start || 1, items } : { t: 'ul', items });
@@ -293,15 +468,30 @@ export const EXTRACT_SCRIPT =
     }
     blocksOf(n.childNodes, out, s);
   };
+  // Closed <details> are opened to be read, and marked so they draw closed.
+  const read = () => {
+    controls = [];
+    consumed = new Set();
+    document.querySelectorAll('details:not([open])').forEach(d => { d.setAttribute('data-peek-closed', ''); d.open = true; });
+    const out = [];
+    if (document.body) blocksOf(document.body.childNodes, out, css(document.body));
+    const root = document.documentElement;
+    const height = Math.max(root.getBoundingClientRect().height, root.scrollHeight > innerHeight + 1 ? root.scrollHeight : 0);
+    return { title: words(document.title), size: [Math.ceil(root.scrollWidth), Math.ceil(height)], blocks: out, controls };
+  };
+`
+
+// Runs in the page copy once it has loaded, and again late in the browser's
+// time budget: puts what the reader read, as base64 of ASCII JSON, in
+// data-peek-text on the root, which --dump-dom prints first.
+export const EXTRACT_SCRIPT =
+  '<script>(() => {' +
+  READER +
+  String.raw`
   const extract = () => {
     const root = document.documentElement;
     try {
-      document.querySelectorAll('details:not([open])').forEach(d => { d.setAttribute('data-peek-closed', ''); d.open = true; });
-      const out = [];
-      if (document.body) blocksOf(document.body.childNodes, out, css(document.body));
-      const height = Math.max(root.getBoundingClientRect().height, root.scrollHeight > innerHeight + 1 ? root.scrollHeight : 0);
-      const page = { title: (document.title || '').trim(), size: [Math.ceil(root.scrollWidth), Math.ceil(height)], blocks: out };
-      const json = JSON.stringify(page).replace(/[\u007f-\uffff]/g, c => '\\u' + ('000' + c.charCodeAt(0).toString(16)).slice(-4));
+      const json = JSON.stringify(read()).replace(/[\u007f-\uffff]/g, c => '\\u' + ('000' + c.charCodeAt(0).toString(16)).slice(-4));
       root.setAttribute('data-peek-text', btoa(json));
     } catch (error) {
       root.setAttribute('data-peek-error', String((error && error.stack) || error).replace(/[^\x20-\x7e]/g, '?').slice(0, 300));
@@ -311,6 +501,9 @@ export const EXTRACT_SCRIPT =
   setTimeout(extract, 2500);
 })()` +
   '</script>'
+
+/** PROTOTYPE (live text): the reader as an expression the live helper evaluates in the open page. */
+export const LIVE_READ = `(() => {${READER}\n  return read();\n})()`
 
 /** The page as the script read it, from what --dump-dom printed. */
 export function readExtracted(dumped: string): Extracted {
@@ -327,14 +520,15 @@ export function readExtracted(dumped: string): Extracted {
 
 /**
  * The page cut into an intro and sections at its second-level headings (third
- * when it has none), each a list of markdown pieces and figures; `boxes` holds
- * each figure's place on the page, in CSS pixels, for cutting it out.
+ * when it has none), each a list of markdown pieces, rows and figures; `boxes`
+ * holds each figure's place on the page, in CSS pixels, for cutting it out.
  */
 export function textOf(page: Extracted, layoutWidth: number): { text: PeekText; boxes: FigureBox[] } {
-  const level = [2, 3].find(l => page.blocks.some(block => block.t === 'h' && block.l === l))
+  const blocks = lift(page.blocks)
+  const level = [2, 3].find(l => blocks.some(block => block.t === 'h' && block.l === l))
   const figures: PeekFigure[] = []
   const boxes: FigureBox[] = []
-  const piecesOf = (blocks: readonly Block[]): PeekPiece[] => {
+  const piecesOf = (list: readonly Block[]): PeekPiece[] => {
     const pieces: PeekPiece[] = []
     let pending: Block[] = []
     const flush = () => {
@@ -342,15 +536,18 @@ export function textOf(page: Extracted, layoutWidth: number): { text: PeekText; 
       if (markdown.trim() !== '') pieces.push({ markdown })
       pending = []
     }
-    for (const block of blocks) {
-      if (block.t !== 'fig') {
+    for (const block of list) {
+      if (block.t === 'row') {
+        flush()
+        pieces.push({ row: block.items.map(item => ('k' in item ? { control: item.k } : { text: item.r })) })
+      } else if (block.t === 'fig') {
+        flush()
+        figures.push({ alt: block.alt, share: Math.min(1, block.w / layoutWidth) })
+        boxes.push({ x: block.x, y: block.y, w: block.w, h: block.h })
+        pieces.push({ figure: figures.length - 1 })
+      } else {
         pending.push(block)
-        continue
       }
-      flush()
-      figures.push({ alt: block.alt, share: Math.min(1, block.w / layoutWidth) })
-      boxes.push({ x: block.x, y: block.y, w: block.w, h: block.h })
-      pieces.push({ figure: figures.length - 1 })
     }
     flush()
     return pieces
@@ -358,16 +555,72 @@ export function textOf(page: Extracted, layoutWidth: number): { text: PeekText; 
 
   const intro: Block[] = []
   const parts: { title: string; blocks: Block[] }[] = []
-  for (const block of page.blocks) {
+  for (const block of blocks) {
     if (block.t === 'h' && block.l === level) parts.push({ title: plainOf(block.r), blocks: [] })
     else (parts.at(-1)?.blocks ?? intro).push(block)
   }
   const introPieces = piecesOf(intro)
   const sections = parts.map(part => ({ title: part.title, pieces: piecesOf(part.blocks) }))
-  return { text: { intro: introPieces, sections, figures }, boxes }
+  return { text: { intro: introPieces, sections, figures, controls: page.controls ?? [] }, boxes }
 }
 
-export type TextHow = { columns: number; drawsImage: boolean }
+function hasRow(blocks: readonly Block[]): boolean {
+  return blocks.some(
+    block =>
+      block.t === 'row' ||
+      ((block.t === 'quote' || block.t === 'details') && hasRow(block.b)) ||
+      ((block.t === 'ul' || block.t === 'ol') && block.items.some(hasRow)),
+  )
+}
+
+// A row of controls cannot sit inside markdown: a quote, a details or a list
+// holding one is opened out around it, its list items marked by hand.
+function lift(blocks: readonly Block[]): Block[] {
+  const out: Block[] = []
+  for (const block of blocks) {
+    if (block.t === 'quote' && hasRow(block.b)) {
+      out.push(...lift(block.b))
+    } else if (block.t === 'details' && hasRow(block.b)) {
+      out.push({ t: 'p', r: block.s.map(run => ({ ...run, b: 1 as const })) }, ...lift(block.b))
+    } else if ((block.t === 'ul' || block.t === 'ol') && block.items.some(hasRow)) {
+      const ordered = block.t === 'ol'
+      const first = block.t === 'ol' ? block.start : 1
+      let plain: Block[][] = []
+      const flushPlain = (next: number) => {
+        if (plain.length > 0) out.push(ordered ? { t: 'ol', start: next - plain.length, items: plain } : { t: 'ul', items: plain })
+        plain = []
+      }
+      block.items.forEach((item, at) => {
+        if (!hasRow(item)) {
+          plain.push(item)
+          return
+        }
+        flushPlain(first + at)
+        const marker = ordered ? `${first + at}.` : '•'
+        const [head, ...rest] = lift(item)
+        if (head?.t === 'row') out.push({ t: 'row', items: [{ r: [{ x: marker }] }, ...head.items] })
+        else if (head?.t === 'p') out.push({ t: 'p', r: [{ x: `${marker} ` }, ...head.r] })
+        else out.push({ t: 'p', r: [{ x: marker }] }, ...(head === undefined ? [] : [head]))
+        out.push(...rest)
+      })
+      flushPlain(first + block.items.length)
+    } else {
+      out.push(block)
+    }
+  }
+  return out
+}
+
+export type TextHow = {
+  columns: number
+  drawsImage: boolean
+  /**
+   * PROTOTYPE (live text): does in the live page what a press asks and shows
+   * the page again; resolves to a note for the row, if any. Absent, the
+   * page's controls are drawn as text.
+   */
+  act?: (action: LiveAction) => Promise<string | undefined>
+}
 
 /** The unfolded row: the prototype's layout switcher, then the page in the layout picked. */
 export async function drawText(
@@ -381,13 +634,31 @@ export async function drawText(
     const { Text } = $.ui.resolve(e)
     return <Text>{`${picture.title}: peek draws its pages in the terminal.`}</Text>
   }
-  const { Box, Text, Button, Markdown, Image } = $.ui.resolve(e)
+  const { Box, Text, Button, Markdown, Image, Input, Select, Link } = $.ui.resolve(e)
   const view = memberOf(viewAtom, e)
   const state = await read($, view)
   const change = (next: (view: PeekView) => PeekView) => () => void update($, view, next)
   const count = VARIANTS.length
   const variant = ((state.variant % count) + count) % count
   const sections = text.sections
+  const controls = text.controls ?? []
+  const act = how.act
+
+  // A press says the page is working, asks the page, then says what came of it.
+  const press = (action: LiveAction) => {
+    if (act === undefined) return
+    void (async () => {
+      await update($, view, v => ({ ...v, busy: true, error: '', notice: '' }))
+      let error = ''
+      let notice = ''
+      try {
+        notice = (await act(action)) ?? ''
+      } catch (failure) {
+        error = failure instanceof Error ? failure.message : String(failure)
+      }
+      await update($, view, v => ({ ...v, busy: false, error, notice }))
+    })()
+  }
 
   const figure = (index: number, key: string): JSX.Element => {
     const shown = text.figures[index]
@@ -410,10 +681,66 @@ export async function drawText(
       </Text>
     )
   }
+  const styled = (run: PeekRun): JSX.Element => {
+    if (run.a !== undefined && LINKABLE.test(run.a)) return <Link href={run.a}>{run.x}</Link>
+    const style: { weight?: 'bold'; italic?: boolean; color?: 'permission' } = {}
+    if (run.b === 1) style.weight = 'bold'
+    if (run.i === 1) style.italic = true
+    if (run.c === 1) style.color = 'permission'
+    return <Text {...style}>{run.x}</Text>
+  }
+  // One of the page's controls: the terminal's own when the page is live,
+  // else its text, dimmed.
+  const control = (index: number): JSX.Element => {
+    const c = controls[index]
+    if (c === undefined) return <Text dimColor>[?]</Text>
+    if (act === undefined || c.off === 1) return <Text dimColor>{flatControl(c)}</Text>
+    const key = `control-${c.id}`
+    const on = (kind: 'click' | 'text' | 'select' | 'range', value?: string) => press({ kind, control: c.id, value })
+    switch (c.k) {
+      case 'button':
+        return c.on === true ? (
+          <Button key={key} variant="primary" label={c.l} onPress={() => on('click')} />
+        ) : (
+          <Button key={key} label={c.l} onPress={() => on('click')} />
+        )
+      case 'check':
+      case 'radio':
+        return <Button key={key} plain label={flatControl(c)} onPress={() => on('click')} />
+      case 'text':
+        return <Input key={key} placeholder={c.ph || c.l || 'text'} value={c.v ?? ''} onSubmit={value => on('text', value)} />
+      case 'select': {
+        const options = uniqueOptions(c)
+        if (options.length === 0) return <Text dimColor>{flatControl(c)}</Text>
+        const value = options.some(option => option.value === c.v) ? c.v : undefined
+        return <Select key={key} options={options} value={value} onSelect={value => on('select', value)} />
+      }
+      case 'range': {
+        const step = Number(c.step) || 1
+        const digits = (c.step?.split('.')[1] ?? '').length
+        const to = (delta: number) =>
+          String(Number(Math.min(Number(c.max ?? 100), Math.max(Number(c.min ?? 0), (Number(c.v) || 0) + delta)).toFixed(digits)))
+        return (
+          <Box flexDirection="row" columnGap={1}>
+            <Button key={`${key}-down`} label="−" onPress={() => on('range', to(-step))} />
+            <Text weight="bold">{c.v ?? ''}</Text>
+            <Button key={`${key}-up`} label="+" onPress={() => on('range', to(step))} />
+          </Box>
+        )
+      }
+    }
+  }
+  const row = (items: readonly PeekRowItem[]): JSX.Element => (
+    <Box flexDirection="row" flexWrap="wrap" columnGap={1} alignItems="center">
+      {items.map(item => ('control' in item ? control(item.control) : <Text>{item.text.map(styled)}</Text>))}
+    </Box>
+  )
   const pieces = (list: readonly PeekPiece[], key: string): JSX.Element[] =>
     list.map((piece, at) =>
       'markdown' in piece ? (
         <Markdown key={`${key}-${at}`} text={piece.markdown} />
+      ) : 'row' in piece ? (
+        row(piece.row)
       ) : (
         figure(piece.figure, `${key}-${at}`)
       ),
@@ -504,12 +831,50 @@ export async function drawText(
       <Text dimColor>prototype switcher</Text>
     </Box>
   )
+  const status: JSX.Element[] = []
+  if (act !== undefined) {
+    status.push(<Button key="live-read" plain dimColor label="↻ read the page again" onPress={() => press({ kind: 'read' })} />)
+    if (state.busy === true) status.push(<Text color="warning">… the page is working</Text>)
+    else if (state.error) status.push(<Text color="error">{`✗ ${state.error}`}</Text>)
+    else if (state.notice) status.push(<Text color="warning">{state.notice}</Text>)
+  }
   return (
     <Box flexDirection="column" gap={1}>
       {switcher}
+      {status.length === 0 ? [] : [<Box flexDirection="row" gap={2}>{status}</Box>]}
       {name === 'Outline' ? outline() : name === 'Document' ? linear() : tabs()}
     </Box>
   )
+}
+
+/** A control as text: a box to tick, a choice, a field, a list, a button. */
+function flatControl(control: PeekControl): string {
+  switch (control.k) {
+    case 'check':
+      return `${control.on === true ? '☑' : '☐'} ${control.l}`
+    case 'radio':
+      return `${control.on === true ? '◉' : '○'} ${control.l}`
+    case 'select':
+      return `[${control.opts?.find(option => option.v === control.v)?.l ?? control.v ?? ''} ▾]`
+    case 'text':
+      return `[${control.v || control.ph || control.l || '…'}]`
+    case 'range':
+      return `[${control.l ? `${control.l} ` : ''}${control.v ?? ''}]`
+    case 'button':
+      return `[${control.l}]`
+  }
+}
+
+/** A select's options as `Select` takes them: values unique. */
+function uniqueOptions(control: PeekControl): { value: string; label: string }[] {
+  const seen = new Set<string>()
+  const options: { value: string; label: string }[] = []
+  for (const option of control.opts ?? []) {
+    if (seen.has(option.v)) continue
+    seen.add(option.v)
+    options.push({ value: option.v, label: option.l || option.v })
+  }
+  return options
 }
 
 function blocksMarkdown(blocks: readonly Block[]): string {
@@ -553,6 +918,8 @@ function blockMarkdown(block: Block): string {
       return [`**${inlineMarkdown(block.s, true, false)}**`, blocksMarkdown(block.b)].filter(part => part !== '').join('\n\n')
     case 'fig':
       return `*[figure] ${escapeMarkdown(block.alt || 'no description')}*`
+    case 'row':
+      return lineSafe(block.items.map(item => ('r' in item ? inlineMarkdown(item.r, false, false) : '')).join(' '))
   }
 }
 

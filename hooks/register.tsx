@@ -10,7 +10,8 @@ import type { PeekBand, PeekMode, PeekPicture } from '../types'
 import { fromBase64 } from './base64'
 import { CELL_ASPECT, fitCells, rasterCells } from './picture'
 import { decodePng, readPngHeader, type Pixels, type PngHeader } from './png'
-import { drawText, EXTRACT_SCRIPT, readExtracted, textOf } from './prototype-text'
+import { actLive, closeLive, openLive } from './prototype-live'
+import { drawText, EXTRACT_SCRIPT, readExtracted, textOf, type LiveAction } from './prototype-text'
 
 type Engine = EngineInterface
 
@@ -50,7 +51,7 @@ const BROWSER_TIMEOUT_MS = 60_000
 const TOOL_TIMEOUT_MS = 60_000
 
 const USAGE =
-  'Usage: /peek <file> [--text] [--blocks|--image]. Shows a PNG, JPEG, WebP, GIF, SVG or HTML page; --text reads a page as text (prototype).'
+  'Usage: /peek <file> [--text|--live] [--blocks|--image]. Shows a PNG, JPEG, WebP, GIF, SVG or HTML page; --text reads a page as text, --live keeps it open so its buttons and fields work (prototypes).'
 
 const TOOL_DESCRIPTION = [
   'Shows a picture or an HTML page to the person right in the chat, inside their terminal, as a row',
@@ -98,8 +99,10 @@ const KINDS: readonly (readonly [RegExp, Kind])[] = [
 ]
 
 type Found = { path: string; size: number }
-type Made = Pick<PeekPicture, 'kind' | 'file' | 'size' | 'width' | 'height' | 'small' | 'bands' | 'note' | 'text'>
-type ShowRequest = { row: string; path: string; title?: string; mode?: PeekMode; view?: 'text'; columns: number }
+type Made = Pick<PeekPicture, 'kind' | 'file' | 'size' | 'width' | 'height' | 'small' | 'bands' | 'note' | 'text' | 'live'>
+type ShowRequest = { row: string; path: string; title?: string; mode?: PeekMode; view?: ViewKind; columns: number }
+/** PROTOTYPE: a page read as text, or kept open live. */
+type ViewKind = 'text' | 'live'
 type Shown = { text: string; forModel: string }
 
 // What the module learns as it goes; a reload starts it over.
@@ -121,7 +124,7 @@ export const register: Register = (on, options) => {
     await $.command.register({
       name: 'peek',
       description: 'Show a picture or an HTML page in the chat',
-      argumentHint: '<file> [--text] [--blocks|--image]',
+      argumentHint: '<file> [--text|--live] [--blocks|--image]',
     })
     await $.tool.register({
       name: 'show',
@@ -175,18 +178,20 @@ export const register: Register = (on, options) => {
 
   on('ui.render', { component: 'CommandOutput' }, async ($, e, next) => {
     if (e.props.command !== 'peek' || e.props.isErrored) return next(e)
-    const picture = (await read($, shownAtom))[commandRow(e.props.args)]
+    const row = commandRow(e.props.args)
+    const picture = (await read($, shownAtom))[row]
     if (picture === undefined) return next(e)
 
-    return drawRow($, e, picture, configured)
+    return drawRow($, e, picture, configured, row)
   })
 
   on('ui.render', { component: 'ToolUse' }, async ($, e, next) => {
     if (e.props.tool !== TOOL || e.props.isRunning || e.props.isErrored) return next(e)
-    const picture = (await read($, shownAtom))[`tool:${e.props.tool_use_id}`]
+    const row = `tool:${e.props.tool_use_id}`
+    const picture = (await read($, shownAtom))[row]
     if (picture === undefined) return next(e)
 
-    return drawRow($, e, picture, configured)
+    return drawRow($, e, picture, configured, row)
   })
 }
 
@@ -199,7 +204,7 @@ function commandRow(args: string): string {
  * once unfolded, the picture as wide as the chat (a picture is not stretched
  * past twice its size, nor taller than the screen; a page is as tall as it is).
  */
-async function drawRow($: Engine, e: RenderInput, picture: PeekPicture, configured: PeekMode | undefined) {
+async function drawRow($: Engine, e: RenderInput, picture: PeekPicture, configured: PeekMode | undefined, row: string) {
   if (e.surface !== 'terminal') {
     const { Text } = $.ui.resolve(e)
     return <Text>{`${picture.title}: peek draws its pictures in the terminal.`}</Text>
@@ -220,7 +225,9 @@ async function drawRow($: Engine, e: RenderInput, picture: PeekPicture, configur
   const facts =
     text === undefined
       ? [`${picture.width}×${picture.height}`, isPage ? 'page' : 'picture', drawsImage ? 'full color' : 'blocks']
-      : ['page as text', `${text.sections.length} sections`, `${text.figures.length} figures`, 'prototype']
+      : picture.live !== undefined
+        ? ['live page', `${text.sections.length} sections`, `${text.controls?.length ?? 0} controls`, 'prototype']
+        : ['page as text', `${text.sections.length} sections`, `${text.figures.length} figures`, 'prototype']
   if (picture.note !== undefined) facts.push(picture.note)
   if (text === undefined && mode === 'image' && !drawsImage) facts.push('too big to send over ssh')
   if (text === undefined && drawsImage && picture.madeFor === 'blocks') facts.push('few pixels: /peek it again')
@@ -237,7 +244,23 @@ async function drawRow($: Engine, e: RenderInput, picture: PeekPicture, configur
   let body: JSX.Element
   if (text !== undefined) {
     try {
-      body = await drawText($, e, picture, text, { columns, drawsImage: mode === 'image' && !remote })
+      const live = picture.live
+      // PROTOTYPE (live text): a press works in the page, then the row shows it anew.
+      const act =
+        live === undefined
+          ? undefined
+          : async (action: LiveAction) => {
+              const done = await actLive($, live, action)
+              await update($, shownAtom, shown => {
+                const old = shown[row]
+                if (old === undefined) return shown
+                const generation = Math.max(0, ...Object.values(shown).map(each => each.generation)) + 1
+                const [width, height] = done.size
+                return { ...shown, [row]: { ...old, text: done.text, live: done.live, width, height, generation } }
+              })
+              return done.notice
+            }
+      body = await drawText($, e, picture, text, { columns, drawsImage: mode === 'image' && !remote, act })
     } catch (error) {
       body = <Text color="red">{`Cannot draw ${picture.title}: ${messageOf(error)}`}</Text>
     }
@@ -320,21 +343,33 @@ async function show($: Engine, configured: PeekMode | undefined, request: ShowRe
   const mode = request.mode ?? configured ?? (await terminalMode($))
   const made = await load($, found, mode, Math.max(10, request.columns - 2), request.view)
 
+  let replaced: PeekPicture | undefined
   await update($, shownAtom, shown => {
+    replaced = shown[request.row]
     const generation = Math.max(0, ...Object.values(shown).map(picture => picture.generation)) + 1
     const picture: PeekPicture = { ...made, path: request.path, title, madeFor: mode, generation }
     if (request.mode !== undefined) picture.mode = request.mode
     const kept = Object.entries(shown).filter(([row]) => row !== request.row)
     return Object.fromEntries([...kept.slice(-(MAX_SHOWN - 1)), [request.row, picture]])
   })
+  if (replaced?.live !== undefined && replaced.live.page !== made.live?.page) closeLive($, replaced.live)
 
   const what =
-    made.text !== undefined
+    made.live !== undefined && made.text !== undefined
+      ? `the page live: ${made.text.sections.length} sections, ${made.text.controls?.length ?? 0} controls`
+      : made.text !== undefined
       ? `the page as text: ${made.text.sections.length} sections, ${made.text.figures.length} figures`
       : made.kind === 'page'
         ? `a ${made.width}×${made.height} snapshot of the page`
         : `${made.width}×${made.height}`
-  const how = made.text !== undefined ? 'in a layout the person can switch' : mode === 'image' ? 'in full color' : 'as colored blocks'
+  const how =
+    made.live !== undefined
+      ? 'as text whose buttons and fields work, in a layout the person can switch'
+      : made.text !== undefined
+        ? 'in a layout the person can switch'
+        : mode === 'image'
+          ? 'in full color'
+          : 'as colored blocks'
   const note = made.note === undefined ? '' : ` (${made.note})`
 
   return {
@@ -343,7 +378,7 @@ async function show($: Engine, configured: PeekMode | undefined, request: ShowRe
   }
 }
 
-async function load($: Engine, found: Found, mode: PeekMode, columns: number, view?: 'text'): Promise<Made> {
+async function load($: Engine, found: Found, mode: PeekMode, columns: number, view?: ViewKind): Promise<Made> {
   let kind = KINDS.find(([pattern]) => pattern.test(found.path))?.[1]
   if (kind === undefined) {
     const header = await pngHeaderOf($, found).catch(() => undefined)
@@ -351,6 +386,7 @@ async function load($: Engine, found: Found, mode: PeekMode, columns: number, vi
   }
   switch (kind) {
     case 'page':
+      if (view === 'live') return livePage($, found, mode, columns)
       return view === 'text' ? textPage($, found, mode, columns) : snapshotPage($, found, mode, columns)
     case 'svg':
       return pictureViaBrowser($, found, mode, { vectorColumns: columns })
@@ -488,6 +524,21 @@ async function textPage($: Engine, found: Found, mode: PeekMode, columns: number
     }
   }
   return { kind: 'page', file: found.path, size: found.size, width: pageWidth, height: pageHeight, text }
+}
+
+/**
+ * PROTOTYPE (live text): the page opened in the live helper's Chrome, laid out
+ * as wide as for a snapshot and kept open, so its controls work from the row.
+ */
+async function livePage($: Engine, found: Found, mode: PeekMode, columns: number): Promise<Made> {
+  const browser = await needBrowser($)
+  const dir = await cacheOf($)
+  const panePx = columns * CELL_PX
+  const width = clamp(Math.round(panePx), MIN_PAGE_WIDTH, PAGE_WIDTH)
+  const scale = shotScale(mode, panePx, width, 2000)
+  const opened = await openLive($, { file: found.path, width, scale, dir, browser })
+  const [pageWidth, pageHeight] = opened.size
+  return { kind: 'page', file: found.path, size: found.size, width: pageWidth, height: pageHeight, text: opened.text, live: opened.live }
 }
 
 /**
@@ -755,19 +806,19 @@ async function removeFile($: Engine, path: string): Promise<void> {
   await $.process.run(['rm', '-f', path])
 }
 
-/** `/peek` arguments: a path, quoted or not, and `--blocks`, `--image` or `--text` anywhere. */
-export function parseArgs(args: string): { path: string; mode?: PeekMode; view?: 'text' } {
+/** `/peek` arguments: a path, quoted or not, and `--blocks`, `--image`, `--text` or `--live` anywhere. */
+export function parseArgs(args: string): { path: string; mode?: PeekMode; view?: ViewKind } {
   let mode: PeekMode | undefined
-  let view: 'text' | undefined
-  const rest = args.replace(/(^|\s)--(blocks|image|text)(?=\s|$)/g, (_, space: string, flag: PeekMode | 'text') => {
-    if (flag === 'text') view = flag
+  let view: ViewKind | undefined
+  const rest = args.replace(/(^|\s)--(blocks|image|text|live)(?=\s|$)/g, (_, space: string, flag: PeekMode | ViewKind) => {
+    if (flag === 'text' || flag === 'live') view = flag
     else mode = flag
     return space
   })
   let path = rest.trim()
   const quote = path[0]
   if (path.length >= 2 && (quote === '"' || quote === "'") && path.endsWith(quote)) path = path.slice(1, -1)
-  const parsed: { path: string; mode?: PeekMode; view?: 'text' } = { path }
+  const parsed: { path: string; mode?: PeekMode; view?: ViewKind } = { path }
   if (mode !== undefined) parsed.mode = mode
   if (view !== undefined) parsed.view = view
   return parsed

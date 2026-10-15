@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Broadcasting playground</title>
+<!-- PROTOTYPE (native-text branch, throwaway): a page to try /peek --live on. -->
+<style>
+  :root { color-scheme: dark; --accent: #5b9dff; }
+  :root[data-color="amber"] { --accent: #f2a93b; }
+  body { margin: 0; padding: 24px 32px 48px; background: #14161b; color: #d9dde6; font: 15px/1.5 system-ui, sans-serif; }
+  h1 { margin: 0 0 4px; font-size: 26px; }
+  h2 { margin: 28px 0 8px; font-size: 18px; color: #fff; }
+  p { margin: 6px 0; max-width: 70ch; }
+  code { font-family: ui-monospace, monospace; color: #e8c07a; }
+  .bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 18px; margin: 10px 0; }
+  .group { display: inline-flex; align-items: center; gap: 6px; }
+  button { background: #262b36; color: #e6e9f0; border: 1px solid #3a4150; border-radius: 6px; padding: 2px 10px; font: inherit; cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  select, input[type="text"] { background: #1d2129; color: #e6e9f0; border: 1px solid #3a4150; border-radius: 6px; padding: 3px 8px; font: inherit; }
+  fieldset { border: 1px solid #2c3240; border-radius: 8px; padding: 6px 12px; margin: 10px 0; display: inline-flex; gap: 14px; }
+  legend { color: #9aa3b5; padding: 0 4px; }
+  .summary { color: #fff; }
+  .note { color: #9aa3b5; }
+  table { border-collapse: collapse; margin: 8px 0; }
+  th, td { border: 1px solid #2c3240; padding: 3px 10px; text-align: right; }
+  th { color: #9aa3b5; font-weight: 600; }
+  td.hit { background: var(--accent); color: #0d0f13; font-weight: 700; }
+  details { margin-top: 18px; border-left: 3px solid var(--accent); padding-left: 12px; }
+  summary { cursor: pointer; font-weight: 600; }
+  pre { background: #1d2129; padding: 8px 12px; border-radius: 6px; }
+</style>
+</head>
+<body>
+<h1>Broadcasting playground</h1>
+<p>A column <code>x</code> and a row <code>y</code> combine into a grid: each value of <code>x</code> meets each value of <code>y</code>. Change the shapes and the operation, and watch the grid follow.</p>
+
+<h2>Shapes</h2>
+<div class="bar">
+  <span class="group">Rows <button id="rows-down" aria-label="fewer rows">−</button> <b id="rows-now">3</b> <button id="rows-up" aria-label="more rows">+</button></span>
+  <span class="group">Columns <button id="cols-down" aria-label="fewer columns">−</button> <b id="cols-now">4</b> <button id="cols-up" aria-label="more columns">+</button></span>
+  <span class="group"><label for="op">Operation</label>
+    <select id="op">
+      <option value="multiply">multiply</option>
+      <option value="add">add</option>
+      <option value="maximum">maximum</option>
+    </select></span>
+</div>
+<p class="summary" id="summary"></p>
+
+<h2>Picture</h2>
+<div class="bar">
+  <label><input type="checkbox" id="values" checked> show values</label>
+  <label><input type="checkbox" id="axes" checked> label the axes</label>
+  <fieldset><legend>Color</legend>
+    <label><input type="radio" name="color" value="blue" checked> blue</label>
+    <label><input type="radio" name="color" value="amber"> amber</label>
+  </fieldset>
+</div>
+<svg id="grid" role="img" aria-label="The column x, the row y and the grid they make" xmlns="http://www.w3.org/2000/svg"></svg>
+
+<h2>Find a value</h2>
+<div class="bar">
+  <label for="find">Find a value</label>
+  <input type="text" id="find" placeholder="a number, say 12">
+  <span class="note" id="found">Type a number and press Enter.</span>
+</div>
+
+<h2>Result</h2>
+<table id="table"></table>
+
+<details>
+  <summary>The broadcasting rule</summary>
+  <p>Line the shapes up from the right. Two sizes fit when they are equal or when one of them is 1; a size of 1 is stretched to match the other.</p>
+  <pre><code>x:      (3, 1)
+y:      (1, 4)
+x op y: (3, 4)</code></pre>
+</details>
+
+<script>
+  const state = { rows: 3, cols: 4, op: 'multiply', find: '', values: true, axes: true };
+  const ops = { multiply: (a, b) => a * b, add: (a, b) => a + b, maximum: (a, b) => Math.max(a, b) };
+  const $ = id => document.getElementById(id);
+  const xs = () => Array.from({ length: state.rows }, (_, i) => i + 1);
+  const ys = () => Array.from({ length: state.cols }, (_, j) => j + 2);
+  const cellOf = (x, y) => ops[state.op](x, y);
+  const isHit = v => state.find !== '' && String(v) === state.find;
+
+  function drawGrid() {
+    const svg = $('grid');
+    const size = 44, gap = 6, left = state.axes ? 70 : 20, top = state.axes ? 46 : 12;
+    const width = left + (state.cols + 1) * (size + gap) + 20;
+    const height = top + (state.rows + 1) * (size + gap) + 16;
+    svg.setAttribute('width', width);
+    svg.setAttribute('height', height);
+    svg.setAttribute('viewBox', '0 0 ' + width + ' ' + height);
+    const accent = getComputedStyle(document.documentElement).getPropertyValue('--accent').trim();
+    const parts = ['<rect width="' + width + '" height="' + height + '" rx="10" fill="#1b1f27"/>'];
+    const box = (cx, cy, fill, text, ink) => {
+      parts.push('<rect x="' + cx + '" y="' + cy + '" width="' + size + '" height="' + size + '" rx="6" fill="' + fill + '"/>');
+      if (state.values) parts.push('<text x="' + (cx + size / 2) + '" y="' + (cy + size / 2 + 6) + '" font-size="16" text-anchor="middle" fill="' + ink + '" font-family="sans-serif">' + text + '</text>');
+    };
+    xs().forEach((x, i) => box(left, top + (i + 1) * (size + gap), '#39404f', x, '#e6e9f0'));
+    ys().forEach((y, j) => box(left + (j + 1) * (size + gap), top, '#39404f', y, '#e6e9f0'));
+    xs().forEach((x, i) => ys().forEach((y, j) => {
+      const v = cellOf(x, y);
+      box(left + (j + 1) * (size + gap), top + (i + 1) * (size + gap), isHit(v) ? '#ffffff' : accent, v, '#0d0f13');
+    }));
+    if (state.axes) {
+      parts.push('<text x="' + (left - 12) + '" y="' + (top + (size + gap) + size / 2 + 6) + '" font-size="15" text-anchor="end" fill="#9aa3b5" font-family="sans-serif">x</text>');
+      parts.push('<text x="' + (left + (size + gap) + size / 2) + '" y="' + (top - 14) + '" font-size="15" text-anchor="middle" fill="#9aa3b5" font-family="sans-serif">y</text>');
+    }
+    svg.innerHTML = parts.join('');
+  }
+
+  function drawTable() {
+    const head = '<tr><th>x \\ y</th>' + ys().map(y => '<th>' + y + '</th>').join('') + '</tr>';
+    const body = xs().map(x => '<tr><th>' + x + '</th>' + ys().map(y => {
+      const v = cellOf(x, y);
+      return '<td' + (isHit(v) ? ' class="hit"' : '') + '>' + v + '</td>';
+    }).join('') + '</tr>').join('');
+    $('table').innerHTML = head + body;
+  }
+
+  function render() {
+    $('rows-now').textContent = state.rows;
+    $('cols-now').textContent = state.cols;
+    $('rows-down').disabled = state.rows <= 1;
+    $('cols-down').disabled = state.cols <= 1;
+    $('rows-up').disabled = state.rows >= 6;
+    $('cols-up').disabled = state.cols >= 6;
+    $('summary').textContent = 'x has shape (' + state.rows + ', 1) and y has shape (1, ' + state.cols + '), so ' + state.op + '(x, y) has shape (' + state.rows + ', ' + state.cols + '): ' + state.rows * state.cols + ' values.';
+    if (state.find === '') $('found').textContent = 'Type a number and press Enter.';
+    else {
+      let hits = 0;
+      xs().forEach(x => ys().forEach(y => { if (isHit(cellOf(x, y))) hits++; }));
+      $('found').textContent = hits === 0 ? 'No cell holds ' + state.find + '.' : hits === 1 ? 'One cell holds ' + state.find + '.' : hits + ' cells hold ' + state.find + '.';
+    }
+    drawGrid();
+    drawTable();
+  }
+
+  const step = (key, by) => () => { state[key] = Math.min(6, Math.max(1, state[key] + by)); render(); };
+  $('rows-down').addEventListener('click', step('rows', -1));
+  $('rows-up').addEventListener('click', step('rows', 1));
+  $('cols-down').addEventListener('click', step('cols', -1));
+  $('cols-up').addEventListener('click', step('cols', 1));
+  $('op').addEventListener('change', e => { state.op = e.target.value; render(); });
+  $('values').addEventListener('change', e => { state.values = e.target.checked; render(); });
+  $('axes').addEventListener('change', e => { state.axes = e.target.checked; render(); });
+  document.querySelectorAll('input[name="color"]').forEach(radio => radio.addEventListener('change', e => {
+    document.documentElement.dataset.color = e.target.value;
+    render();
+  }));
+  $('find').addEventListener('change', e => { state.find = e.target.value.trim(); render(); });
+  $('find').addEventListener('keydown', e => { if (e.key === 'Enter') { state.find = e.target.value.trim(); render(); } });
+  render();
+</script>
+</body>
+</html>
