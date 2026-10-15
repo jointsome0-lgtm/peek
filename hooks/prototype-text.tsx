@@ -5,23 +5,27 @@
 // terminal's buttons, fields and lists, working in a page kept open.
 //
 // Question: does a page read well in the chat as text, and which layout feels
-// right: Outline (folded sections, a bar to travel between them), Document
-// (all of it) or Tabs (one section at a time)? Centered or at the left? With
-// --live: does using the page from the chat feel right?
+// right: Outline (folded sections), Document (all of it) or Tabs (one section
+// at a time)? Centered or at the left? Does an index of its sections in the
+// band above the prompt make travel quick? With --live: does using the page
+// from the chat feel right?
 //
 // Run: /peek <page.html> --text (or --live), unfold the row, flip layouts with
-// ◂ and ▸, and the column with center and left.
+// ◂ and ▸, and the column with center and left; travel with the band.
 // This file never merges; the decision lands on main, rewritten with tests.
 
 import { atom, memberOf, read, update } from 'claude-code'
-import type { EngineInterface, RenderInput } from 'claude-code'
+import type { EngineInterface, RenderInput, UiScrollTarget } from 'claude-code'
 
-import type { PeekControl, PeekFigure, PeekPicture, PeekPiece, PeekRowItem, PeekRun, PeekText, PeekView } from '../types'
+import type { PeekControl, PeekFigure, PeekNav, PeekPicture, PeekPiece, PeekRowItem, PeekRun, PeekText, PeekView } from '../types'
 import { fromBase64 } from './base64'
 import { fitCells } from './picture'
 
 const VARIANTS = ['Outline', 'Document', 'Tabs'] as const
 const viewAtom = atom({ plugin: 'peek', key: 'view' } as const, { variant: 0, open: [0], tab: 0 })
+/** PROTOTYPE (index): the row whose page the band above the prompt indexes. */
+const navAtom = atom({ plugin: 'peek', key: 'nav' } as const, null)
+type Layout = (typeof VARIANTS)[number]
 const MAX_IMAGE = 255
 /** The widest the text runs, in columns: a column to read, centered or at the left. */
 const READ_COLUMNS = 100
@@ -624,6 +628,8 @@ export type TextHow = {
    * page's controls are drawn as text.
    */
   act?: (action: LiveAction) => Promise<string | undefined>
+  /** PROTOTYPE (index): makes this row's page the one the band above the prompt indexes. */
+  claim?: () => void
 }
 
 /** The unfolded row: the prototype's layout switcher, then the page in the layout picked. */
@@ -652,7 +658,6 @@ export async function drawText(
   // Keys the chat scrolls to, the row's own: two rows may show one page.
   const tag = tagOf(e.requestId)
   const headKey = (at: number) => `fold-${at}-${tag}`
-  const contentsKey = `go-0-${tag}`
 
   // A press says the page is working, asks the page, then says what came of it.
   const press = (action: LiveAction) => {
@@ -670,25 +675,13 @@ export async function drawText(
     })()
   }
 
-  // Travel: brings a heading to the top of the screen, opening its section.
-  // The first scroll answers the press at once; the second lands it once open.
-  const travel = (key: string, open?: number) => () => {
-    const scroll = () =>
-      $.ui.scroll({ to: { key }, block: 'start' }).then(
-        moved => moved.deny,
-        (failure: unknown) => (failure instanceof Error ? failure.message : String(failure)),
-      )
-    const first = scroll()
-    void (async () => {
-      let deny = await first
-      if (open !== undefined && !state.open.includes(open)) {
-        await update($, view, v => (v.open.includes(open) ? v : { ...v, open: [...v.open, open] }))
-        const second = await scroll()
-        if (deny !== undefined) deny = second
-      }
+  // Travel, in Outline: opens a section and brings it to the top of the screen.
+  const travel = (at: number) => () => {
+    how.claim?.()
+    void sectionTravel($, e.requestId, 'Outline', at, state.open.includes(at)).then(deny => {
       const notice = deny === undefined ? '' : `could not scroll there: ${deny}`
-      await update($, view, v => (v.notice === notice ? v : { ...v, notice }))
-    })()
+      return update($, view, v => (v.notice === notice ? v : { ...v, notice }))
+    })
   }
 
   const figure = (index: number, key: string): JSX.Element => {
@@ -778,29 +771,15 @@ export async function drawText(
     )
   const heading = (title: string, key: string) => <Markdown key={key} text={`## ${escapeMarkdown(title)}`} />
 
-  // Outline: the intro, a bar to travel to any section, then one folding row
-  // per section; the first starts open, and each open one ends in a way on.
+  // Outline: the intro, then one folding row per section; the first starts
+  // open, and each open one ends in a way back and a way on. The band above
+  // the prompt indexes the sections.
   const travels = sections.length > 1
   const outline = () => (
     <Box flexDirection="column">
       <Box flexDirection="column" gap={1} marginBottom={1}>
         {pieces(text.intro, 'intro')}
       </Box>
-      {!travels
-        ? []
-        : [
-            <Box flexDirection="row" flexWrap="wrap" columnGap={1} marginBottom={1}>
-              <Text dimColor>go to</Text>
-              {sections.map((s, at) => (
-                <Button
-                  key={`go-${at}-${tag}`}
-                  dimColor={!state.open.includes(at)}
-                  label={`${at + 1} ${short(s.title)}`}
-                  onPress={travel(headKey(at), at)}
-                />
-              ))}
-            </Box>,
-          ]}
       {sections.map((section, at) => {
         const isOpen = state.open.includes(at)
         const toggle = (
@@ -822,11 +801,10 @@ export async function drawText(
               <Box flexDirection="row" flexWrap="wrap" columnGap={3}>
                 {before === undefined
                   ? []
-                  : [<Button key={`back-${at}-${tag}`} plain dimColor label={`◂ ${short(before.title)}`} onPress={travel(headKey(at - 1), at - 1)} />]}
-                <Button key={`up-${at}-${tag}`} plain dimColor label="▴ go to" onPress={travel(contentsKey)} />
+                  : [<Button key={`back-${at}-${tag}`} plain dimColor label={`◂ ${short(before.title)}`} onPress={travel(at - 1)} />]}
                 {after === undefined
                   ? []
-                  : [<Button key={`next-${at}-${tag}`} plain label={`${short(after.title)} ▸`} onPress={travel(headKey(at + 1), at + 1)} />]}
+                  : [<Button key={`next-${at}-${tag}`} plain label={`${short(after.title)} ▸`} onPress={travel(at + 1)} />]}
               </Box>,
             ]
         return (
@@ -850,7 +828,7 @@ export async function drawText(
   const linear = () => (
     <Box flexDirection="column" gap={1}>
       {pieces(text.intro, 'intro')}
-      {sections.flatMap((section, at) => [heading(section.title, `title-${at}`), ...pieces(section.pieces, `s${at}`)])}
+      {sections.flatMap((section, at) => [heading(section.title, `title-${at}-${tag}`), ...pieces(section.pieces, `s${at}`)])}
     </Box>
   )
 
@@ -913,6 +891,97 @@ export async function drawText(
         {name === 'Outline' ? outline() : name === 'Document' ? linear() : tabs()}
       </Box>
     </Box>
+  )
+}
+
+/** The layout a row's view picks. */
+function layoutOf(view: PeekView): Layout {
+  const count = VARIANTS.length
+  return VARIANTS[((view.variant % count) + count) % count] ?? 'Outline'
+}
+
+/** PROTOTYPE (index): makes a row's page the one the band above the prompt indexes. */
+export function claimIndex($: EngineInterface, row: string, requestId: string): void {
+  void update($, navAtom, nav =>
+    nav !== null && nav.row === row && nav.requestId === requestId && nav.note === undefined ? nav : { row, requestId },
+  )
+}
+
+/**
+ * PROTOTYPE (index): the band above the prompt while a page's row is unfolded:
+ * its sections to travel to, by a click or, the prompt empty, by their digit;
+ * a section the row shows now is drawn bright, the others dim.
+ */
+export async function drawIndex(
+  $: EngineInterface,
+  e: RenderInput,
+  nav: PeekNav,
+  picture: PeekPicture,
+): Promise<JSX.Element | undefined> {
+  const sections = picture.text?.sections ?? []
+  if (sections.length < 2) return undefined
+  const { Box, Text, Button } = $.ui.resolve(e)
+  const state = await read($, memberOf(viewAtom, { requestId: nav.requestId }))
+  const layout = layoutOf(state)
+  const tab = Math.min(Math.max(state.tab, 0), sections.length - 1)
+  const isShown = (at: number) => (layout === 'Document' ? true : layout === 'Tabs' ? tab === at : state.open.includes(at))
+  // What the last press came to: why the chat did not scroll, if it did not.
+  const said = (deny: string | undefined) =>
+    update($, navAtom, now => {
+      if (now === null || now.requestId !== nav.requestId) return now
+      if (deny === undefined) return now.note === undefined ? now : { row: now.row, requestId: now.requestId }
+      return { ...now, note: `could not scroll there: ${deny}` }
+    })
+  return (
+    <Box flexDirection="row" flexWrap="wrap" columnGap={2}>
+      <Text dimColor>{`${short(picture.title, 32)}:`}</Text>
+      {sections.map((section, at) => (
+        <Button
+          key={`index-${at}`}
+          plain
+          {...(at < 9 ? { hotkey: String(at + 1) } : {})}
+          dimColor={!isShown(at)}
+          label={short(section.title)}
+          onPress={() => void sectionTravel($, nav.requestId, layout, at, isShown(at)).then(said)}
+        />
+      ))}
+      <Button key="index-top" plain dimColor label="▴ top" onPress={() => void scrollTop($, { requestId: nav.requestId }).then(said)} />
+      {nav.note === undefined ? [] : [<Text color="warning">{nav.note}</Text>]}
+    </Box>
+  )
+}
+
+/**
+ * PROTOTYPE (index): travels a row's page to section `at` as its layout shows
+ * sections, and brings the section to the top of the screen. The first scroll
+ * answers the press at once; the second lands it once the section shows.
+ * Resolves to why the chat did not scroll, if it did not.
+ */
+async function sectionTravel(
+  $: EngineInterface,
+  requestId: string,
+  layout: Layout,
+  at: number,
+  isShown: boolean,
+): Promise<string | undefined> {
+  const tag = tagOf(requestId)
+  const to: UiScrollTarget =
+    layout === 'Tabs' ? { requestId } : { key: layout === 'Document' ? `title-${at}-${tag}` : `fold-${at}-${tag}` }
+  const first = scrollTop($, to)
+  if (isShown) return first
+  const deny = await first
+  await update($, memberOf(viewAtom, { requestId }), v =>
+    layout === 'Tabs' ? { ...v, tab: at } : v.open.includes(at) ? v : { ...v, open: [...v.open, at] },
+  )
+  const second = await scrollTop($, to)
+  return deny === undefined ? undefined : second
+}
+
+/** Brings `to` to the top of the screen; resolves to why not, if not. */
+function scrollTop($: EngineInterface, to: UiScrollTarget): Promise<string | undefined> {
+  return $.ui.scroll({ to, block: 'start' }).then(
+    moved => moved.deny,
+    (failure: unknown) => (failure instanceof Error ? failure.message : String(failure)),
   )
 }
 

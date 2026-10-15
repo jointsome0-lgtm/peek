@@ -11,13 +11,15 @@ import { fromBase64 } from './base64'
 import { CELL_ASPECT, fitCells, rasterCells } from './picture'
 import { decodePng, readPngHeader, type Pixels, type PngHeader } from './png'
 import { actLive, closeLive, openLive } from './prototype-live'
-import { drawText, EXTRACT_SCRIPT, readExtracted, textOf, type LiveAction } from './prototype-text'
+import { claimIndex, drawIndex, drawText, EXTRACT_SCRIPT, readExtracted, textOf, type LiveAction } from './prototype-text'
 
 type Engine = EngineInterface
 
 const TOOL = 'mcp__peek__show'
 const shownAtom = atom({ plugin: 'peek', key: 'shown' } as const, {})
 const isOpenAtom = atom({ plugin: 'peek', key: 'isOpen' } as const, false)
+/** PROTOTYPE (index): the row whose page the band above the prompt indexes; the scan wants it named here too. */
+const navAtom = atom({ plugin: 'peek', key: 'nav' } as const, null)
 
 /** Rows past this many lose their pictures, oldest first, and draw as text. */
 const MAX_SHOWN = 30
@@ -193,6 +195,17 @@ export const register: Register = (on, options) => {
 
     return drawRow($, e, picture, configured, row)
   })
+
+  // PROTOTYPE (index): the sections of the page unfolded last, in the band
+  // above the prompt, while its row stays unfolded.
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    if (e.surface !== 'terminal' || e.props.hasSurvey || e.props.view.agentId !== undefined) return next(e)
+    const nav = await read($, navAtom)
+    if (nav === null) return next(e)
+    const picture = (await read($, shownAtom))[nav.row]
+    if (picture === undefined || !(await read($, memberOf(isOpenAtom, { requestId: nav.requestId })))) return next(e)
+    return (await drawIndex($, e, nav, picture)) ?? next(e)
+  })
 }
 
 function commandRow(args: string): string {
@@ -236,7 +249,11 @@ async function drawRow($: Engine, e: RenderInput, picture: PeekPicture, configur
       key="toggle"
       plain
       label={`${open ? '▾' : '▸'} ${picture.title} · ${facts.join(' · ')}${open ? '' : ' · click to unfold'}`}
-      onPress={() => void update($, isOpen, value => !value)}
+      onPress={() => {
+        void update($, isOpen, value => !value)
+        // PROTOTYPE (index): the band above the prompt indexes the page unfolded last.
+        if ((text?.sections.length ?? 0) > 1) claimIndex($, row, e.requestId)
+      }}
     />
   )
   if (!open) return toggle
@@ -260,7 +277,8 @@ async function drawRow($: Engine, e: RenderInput, picture: PeekPicture, configur
               })
               return done.notice
             }
-      body = await drawText($, e, picture, text, { columns, drawsImage: mode === 'image' && !remote, act })
+      const claim = () => claimIndex($, row, e.requestId)
+      body = await drawText($, e, picture, text, { columns, drawsImage: mode === 'image' && !remote, act, claim })
     } catch (error) {
       body = <Text color="red">{`Cannot draw ${picture.title}: ${messageOf(error)}`}</Text>
     }

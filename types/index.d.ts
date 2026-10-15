@@ -85,6 +85,12 @@ export type PeekLive = {
   browser: string
 }
 
+/**
+ * PROTOTYPE (index): the row whose page the band above the prompt indexes:
+ * its key in `shown`, its render instance, and what the last press came to.
+ */
+export type PeekNav = { row: string; requestId: string; note?: string }
+
 /** PROTOTYPE (native-text): a figure of the page, cut from a snapshot of it where that worked. */
 export type PeekFigure = {
   /** What the page says the figure shows; drawn where the figure cannot be. */
@@ -119,6 +125,8 @@ declare module 'claude-code' {
       isOpen: StateFamily<boolean>
       /** PROTOTYPE (native-text): how each row shows a page as text. */
       view: StateFamily<PeekView>
+      /** PROTOTYPE (index): the row whose page the band above the prompt indexes, while it is unfolded. */
+      nav: PeekNav | null
     }
   }
 }
