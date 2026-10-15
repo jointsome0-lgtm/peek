@@ -11,7 +11,7 @@ import { fromBase64 } from './base64'
 import { CELL_ASPECT, fitCells, rasterCells } from './picture'
 import { decodePng, readPngHeader, type Pixels, type PngHeader } from './png'
 import { actLive, closeLive, openLive } from './prototype-live'
-import { claimIndex, drawIndex, drawText, EXTRACT_SCRIPT, readExtracted, textOf, type LiveAction } from './prototype-text'
+import { claimIndex, drawIndex, drawText, EXTRACT_SCRIPT, isIndexed, readExtracted, textOf, type LiveAction } from './prototype-text'
 
 type Engine = EngineInterface
 
@@ -252,7 +252,7 @@ async function drawRow($: Engine, e: RenderInput, picture: PeekPicture, configur
       onPress={() => {
         void update($, isOpen, value => !value)
         // PROTOTYPE (index): the band above the prompt indexes the page unfolded last.
-        if ((text?.sections.length ?? 0) > 1) claimIndex($, row, e.requestId)
+        if (text !== undefined && isIndexed(text)) claimIndex($, row, e.requestId)
       }}
     />
   )

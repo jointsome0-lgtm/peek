@@ -103,8 +103,14 @@ export type PeekFigure = {
   height?: number
 }
 
-/** PROTOTYPE (native-text): the part of a page under one of its headings. */
-export type PeekSection = { title: string; pieces: PeekPiece[] }
+/** PROTOTYPE (index): a heading under a section's own: its text, its level, the piece of the section it starts. */
+export type PeekSub = { title: string; level: number; piece: number }
+
+/** PROTOTYPE (native-text): the part of a page under one of its headings, and the headings under that one. */
+export type PeekSection = { title: string; pieces: PeekPiece[]; subs?: PeekSub[] }
+
+/** PROTOTYPE (index): a place in a page: a section, and a piece of it. */
+export type PeekPlace = { section: number; piece: number }
 
 /** PROTOTYPE (native-text): a page as text: what comes before its first heading, then its sections. */
 export type PeekText = { intro: PeekPiece[]; sections: PeekSection[]; figures: PeekFigure[]; controls?: PeekControl[] }
@@ -112,9 +118,19 @@ export type PeekText = { intro: PeekPiece[]; sections: PeekSection[]; figures: P
 /**
  * PROTOTYPE (native-text): how a row shows its text: the layout picked, open
  * sections, the tab shown, whether the text sits at the chat's left rather
- * than in its middle; whether a press is under way and what the last one said.
+ * than in its middle, where travel made the row start (what comes before
+ * folds into one line); whether a press is under way and what the last one said.
  */
-export type PeekView = { variant: number; open: number[]; tab: number; left?: boolean; busy?: boolean; error?: string; notice?: string }
+export type PeekView = {
+  variant: number
+  open: number[]
+  tab: number
+  left?: boolean
+  start?: PeekPlace
+  busy?: boolean
+  error?: string
+  notice?: string
+}
 
 declare module 'claude-code' {
   interface PluginState {

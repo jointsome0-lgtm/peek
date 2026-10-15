@@ -7,17 +7,32 @@
 // Question: does a page read well in the chat as text, and which layout feels
 // right: Outline (folded sections), Document (all of it) or Tabs (one section
 // at a time)? Centered or at the left? Does an index of its sections in the
-// band above the prompt make travel quick? With --live: does using the page
+// band above the prompt make travel quick, and do two levels of it (sections,
+// then the parts of one) serve a big page? With --live: does using the page
 // from the chat feel right?
 //
 // Run: /peek <page.html> --text (or --live), unfold the row, flip layouts with
 // ◂ and ▸, and the column with center and left; travel with the band.
+// prototype/deep-demo.html is a big page to travel.
 // This file never merges; the decision lands on main, rewritten with tests.
 
 import { atom, memberOf, read, update } from 'claude-code'
 import type { EngineInterface, RenderInput, UiScrollTarget } from 'claude-code'
 
-import type { PeekControl, PeekFigure, PeekNav, PeekPicture, PeekPiece, PeekRowItem, PeekRun, PeekText, PeekView } from '../types'
+import type {
+  PeekControl,
+  PeekFigure,
+  PeekNav,
+  PeekPicture,
+  PeekPiece,
+  PeekPlace,
+  PeekRowItem,
+  PeekRun,
+  PeekSection,
+  PeekSub,
+  PeekText,
+  PeekView,
+} from '../types'
 import { fromBase64 } from './base64'
 import { fitCells } from './picture'
 
@@ -528,15 +543,17 @@ export function readExtracted(dumped: string): Extracted {
 
 /**
  * The page cut into an intro and sections at its second-level headings (third
- * when it has none), each a list of markdown pieces, rows and figures; `boxes`
- * holds each figure's place on the page, in CSS pixels, for cutting it out.
+ * when it has none), each a list of markdown pieces, rows and figures, a piece
+ * starting at each heading under the section's own; `boxes` holds each
+ * figure's place on the page, in CSS pixels, for cutting it out.
  */
 export function textOf(page: Extracted, layoutWidth: number): { text: PeekText; boxes: FigureBox[] } {
   const blocks = lift(page.blocks)
   const level = [2, 3].find(l => blocks.some(block => block.t === 'h' && block.l === l))
   const figures: PeekFigure[] = []
   const boxes: FigureBox[] = []
-  const piecesOf = (list: readonly Block[]): PeekPiece[] => {
+  // With `subs`, a heading under the section's own starts a piece, and is noted there.
+  const piecesOf = (list: readonly Block[], subs?: PeekSub[]): PeekPiece[] => {
     const pieces: PeekPiece[] = []
     let pending: Block[] = []
     const flush = () => {
@@ -553,6 +570,10 @@ export function textOf(page: Extracted, layoutWidth: number): { text: PeekText; 
         figures.push({ alt: block.alt, share: Math.min(1, block.w / layoutWidth) })
         boxes.push({ x: block.x, y: block.y, w: block.w, h: block.h })
         pieces.push({ figure: figures.length - 1 })
+      } else if (subs !== undefined && block.t === 'h' && block.l > (level ?? 6)) {
+        flush()
+        subs.push({ title: plainOf(block.r), level: block.l, piece: pieces.length })
+        pending.push(block)
       } else {
         pending.push(block)
       }
@@ -568,7 +589,11 @@ export function textOf(page: Extracted, layoutWidth: number): { text: PeekText; 
     else (parts.at(-1)?.blocks ?? intro).push(block)
   }
   const introPieces = piecesOf(intro)
-  const sections = parts.map(part => ({ title: part.title, pieces: piecesOf(part.blocks) }))
+  const sections = parts.map((part): PeekSection => {
+    const subs: PeekSub[] = []
+    const pieces = piecesOf(part.blocks, subs)
+    return subs.length === 0 ? { title: part.title, pieces } : { title: part.title, pieces, subs }
+  })
   return { text: { intro: introPieces, sections, figures, controls: page.controls ?? [] }, boxes }
 }
 
@@ -655,9 +680,7 @@ export async function drawText(
   const act = how.act
   const left = state.left === true
   const wide = Math.min(how.columns, READ_COLUMNS)
-  // Keys the chat scrolls to, the row's own: two rows may show one page.
-  const tag = tagOf(e.requestId)
-  const headKey = (at: number) => `fold-${at}-${tag}`
+  const start = startOf(state, text)
 
   // A press says the page is working, asks the page, then says what came of it.
   const press = (action: LiveAction) => {
@@ -675,12 +698,13 @@ export async function drawText(
     })()
   }
 
-  // Travel, in Outline: opens a section and brings it to the top of the screen.
-  const travel = (at: number) => () => {
+  // Travel: the row starts at a place, or with none at its top again, and the
+  // chat brings the row's top to the top of the screen.
+  const travel = (to?: PeekPlace) => () => {
     how.claim?.()
-    void sectionTravel($, e.requestId, 'Outline', at, state.open.includes(at)).then(deny => {
+    void travelRow($, e.requestId, to).then(deny => {
       const notice = deny === undefined ? '' : `could not scroll there: ${deny}`
-      return update($, view, v => (v.notice === notice ? v : { ...v, notice }))
+      return update($, view, v => ((v.notice ?? '') === notice ? v : { ...v, notice }))
     })
   }
 
@@ -759,78 +783,119 @@ export async function drawText(
       {items.map(item => ('control' in item ? control(item.control) : <Text>{item.text.map(styled)}</Text>))}
     </Box>
   )
-  const pieces = (list: readonly PeekPiece[], key: string): JSX.Element[] =>
-    list.map((piece, at) =>
+  // The pieces of a list from the piece `from` on, keyed by their places in it.
+  const pieces = (list: readonly PeekPiece[], key: string, from = 0): JSX.Element[] =>
+    list.slice(from).map((piece, k) =>
       'markdown' in piece ? (
-        <Markdown key={`${key}-${at}`} text={piece.markdown} />
+        <Markdown key={`${key}-${from + k}`} text={piece.markdown} />
       ) : 'row' in piece ? (
         row(piece.row)
       ) : (
-        figure(piece.figure, `${key}-${at}`)
+        figure(piece.figure, `${key}-${from + k}`)
       ),
     )
   const heading = (title: string, key: string) => <Markdown key={key} text={`## ${escapeMarkdown(title)}`} />
+
+  // Where travel made the row start: what comes before folds into one line,
+  // and a section shown from a part of it gets a line back to its top.
+  const intro = text.intro.length === 0 ? [] : ['intro']
+  const before = (at: number) => [...intro, ...sections.slice(0, at).map(section => section.title)]
+  const above = (names: readonly string[]): JSX.Element[] =>
+    start === undefined || names.length === 0
+      ? []
+      : [<Button key="above" plain dimColor label={short(`▴ above: ${names.join(' · ')}`, wide)} onPress={travel()} />]
+  const startPiece = (at: number) => (start !== undefined && start.section === at ? start.piece : 0)
+  const earlier = (at: number): JSX.Element[] =>
+    startPiece(at) === 0
+      ? []
+      : [
+          <Button
+            key={`earlier-${at}`}
+            plain
+            dimColor
+            label={`▴ earlier in ${short(sections[at]?.title ?? '')}`}
+            onPress={travel({ section: at, piece: 0 })}
+          />,
+        ]
 
   // Outline: the intro, then one folding row per section; the first starts
   // open, and each open one ends in a way back and a way on. The band above
   // the prompt indexes the sections.
   const travels = sections.length > 1
-  const outline = () => (
-    <Box flexDirection="column">
-      <Box flexDirection="column" gap={1} marginBottom={1}>
-        {pieces(text.intro, 'intro')}
-      </Box>
-      {sections.map((section, at) => {
-        const isOpen = state.open.includes(at)
-        const toggle = (
-          <Button
-            key={headKey(at)}
-            plain
-            onPress={change(v => ({ ...v, open: v.open.includes(at) ? v.open.filter(k => k !== at) : [...v.open, at] }))}
-          >
-            {isOpen ? '▾ ' : '▸ '}
-            <Text weight="bold">{section.title}</Text>
-          </Button>
-        )
-        if (!isOpen) return toggle
-        const before = sections[at - 1]
-        const after = sections[at + 1]
-        const ways = !travels
-          ? []
-          : [
-              <Box flexDirection="row" flexWrap="wrap" columnGap={3}>
-                {before === undefined
-                  ? []
-                  : [<Button key={`back-${at}-${tag}`} plain dimColor label={`◂ ${short(before.title)}`} onPress={travel(at - 1)} />]}
-                {after === undefined
-                  ? []
-                  : [<Button key={`next-${at}-${tag}`} plain label={`${short(after.title)} ▸`} onPress={travel(at + 1)} />]}
-              </Box>,
-            ]
-        return (
-          <Box flexDirection="column">
-            {toggle}
-            <Box flexDirection="column" gap={1} paddingLeft={2} marginTop={1} marginBottom={1}>
-              {pieces(section.pieces, `s${at}`)}
-              {ways}
-            </Box>
+  const outline = () => {
+    const first = start?.section ?? 0
+    return (
+      <Box flexDirection="column">
+        {start === undefined ? (
+          <Box flexDirection="column" gap={1} marginBottom={1}>
+            {pieces(text.intro, 'intro')}
           </Box>
-        )
-      })}
-      <Box flexDirection="row" gap={3} marginTop={1}>
-        <Button key="unfold-all" plain dimColor label="unfold all" onPress={change(v => ({ ...v, open: sections.map((_, k) => k) }))} />
-        <Button key="fold-all" plain dimColor label="fold all" onPress={change(v => ({ ...v, open: [] }))} />
+        ) : (
+          above(before(first))
+        )}
+        {sections.slice(first).map((section, k) => {
+          const at = first + k
+          const isOpen = state.open.includes(at)
+          const toggle = (
+            <Button
+              key={`fold-${at}`}
+              plain
+              onPress={change(v => ({ ...v, open: v.open.includes(at) ? v.open.filter(one => one !== at) : [...v.open, at] }))}
+            >
+              {isOpen ? '▾ ' : '▸ '}
+              <Text weight="bold">{section.title}</Text>
+            </Button>
+          )
+          if (!isOpen) return toggle
+          const back = sections[at - 1]
+          const on = sections[at + 1]
+          const ways = !travels
+            ? []
+            : [
+                <Box flexDirection="row" flexWrap="wrap" columnGap={3}>
+                  {back === undefined
+                    ? []
+                    : [<Button key={`back-${at}`} plain dimColor label={`◂ ${short(back.title)}`} onPress={travel({ section: at - 1, piece: 0 })} />]}
+                  {on === undefined
+                    ? []
+                    : [<Button key={`next-${at}`} plain label={`${short(on.title)} ▸`} onPress={travel({ section: at + 1, piece: 0 })} />]}
+                </Box>,
+              ]
+          return (
+            <Box flexDirection="column">
+              {toggle}
+              <Box flexDirection="column" gap={1} paddingLeft={2} marginTop={1} marginBottom={1}>
+                {earlier(at)}
+                {pieces(section.pieces, `s${at}`, startPiece(at))}
+                {ways}
+              </Box>
+            </Box>
+          )
+        })}
+        <Box flexDirection="row" gap={3} marginTop={1}>
+          <Button key="unfold-all" plain dimColor label="unfold all" onPress={change(v => ({ ...v, open: sections.map((_, k) => k) }))} />
+          <Button key="fold-all" plain dimColor label="fold all" onPress={change(v => ({ ...v, open: [] }))} />
+        </Box>
       </Box>
-    </Box>
-  )
+    )
+  }
 
   // Document: everything at once, as a reply of Claude's reads.
-  const linear = () => (
-    <Box flexDirection="column" gap={1}>
-      {pieces(text.intro, 'intro')}
-      {sections.flatMap((section, at) => [heading(section.title, `title-${at}-${tag}`), ...pieces(section.pieces, `s${at}`)])}
-    </Box>
-  )
+  const linear = () => {
+    const first = start?.section ?? 0
+    return (
+      <Box flexDirection="column" gap={1}>
+        {start === undefined ? pieces(text.intro, 'intro') : above(before(first))}
+        {sections
+          .slice(first)
+          .flatMap((section, k) => [
+            heading(section.title, `title-${first + k}`),
+            ...earlier(first + k),
+            ...pieces(section.pieces, `s${first + k}`, startPiece(first + k)),
+          ])}
+      </Box>
+    )
+  }
 
   // Tabs: a bar of numbered sections and one section at a time.
   const tabs = () => {
@@ -838,12 +903,13 @@ export async function drawText(
     if (last < 0) return linear()
     const tab = Math.min(Math.max(state.tab, 0), last)
     const section = sections[tab]!
-    const go = (to: number) => change(v => ({ ...v, tab: to }))
-    const before = sections[tab - 1]
-    const after = sections[tab + 1]
+    // A tab picked from the bar shows from its top, and the intro stays as it is.
+    const go = (to: number) => change(v => (v.start === undefined ? { ...v, tab: to } : { ...v, tab: to, start: { section: to, piece: 0 } }))
+    const back = sections[tab - 1]
+    const on = sections[tab + 1]
     return (
       <Box flexDirection="column" gap={1}>
-        {pieces(text.intro, 'intro')}
+        {start === undefined ? pieces(text.intro, 'intro') : above(intro)}
         <Box flexDirection="row" flexWrap="wrap" columnGap={1}>
           {sections.map((s, at) =>
             at === tab ? (
@@ -854,11 +920,16 @@ export async function drawText(
           )}
         </Box>
         {heading(section.title, 'tab-title')}
-        {pieces(section.pieces, `t${tab}`)}
+        {earlier(tab)}
+        {pieces(section.pieces, `t${tab}`, startPiece(tab))}
         <Box flexDirection="row" gap={3}>
-          {before === undefined ? [] : [<Button key="tab-back" plain label={`◂ ${short(before.title)}`} onPress={go(tab - 1)} />]}
+          {back === undefined
+            ? []
+            : [<Button key="tab-back" plain label={`◂ ${short(back.title)}`} onPress={travel({ section: tab - 1, piece: 0 })} />]}
           <Text dimColor>{`${tab + 1} of ${last + 1}`}</Text>
-          {after === undefined ? [] : [<Button key="tab-next" plain label={`${short(after.title)} ▸`} onPress={go(tab + 1)} />]}
+          {on === undefined
+            ? []
+            : [<Button key="tab-next" plain label={`${short(on.title)} ▸`} onPress={travel({ section: tab + 1, piece: 0 })} />]}
         </Box>
       </Box>
     )
@@ -900,6 +971,11 @@ function layoutOf(view: PeekView): Layout {
   return VARIANTS[((view.variant % count) + count) % count] ?? 'Outline'
 }
 
+/** PROTOTYPE (index): whether a page has the parts for the band above the prompt to index. */
+export function isIndexed(text: PeekText): boolean {
+  return text.sections.length > 1 || (text.sections[0]?.subs?.length ?? 0) > 1
+}
+
 /** PROTOTYPE (index): makes a row's page the one the band above the prompt indexes. */
 export function claimIndex($: EngineInterface, row: string, requestId: string): void {
   void update($, navAtom, nav =>
@@ -909,8 +985,9 @@ export function claimIndex($: EngineInterface, row: string, requestId: string): 
 
 /**
  * PROTOTYPE (index): the band above the prompt while a page's row is unfolded:
- * its sections to travel to, by a click or, the prompt empty, by their digit;
- * a section the row shows now is drawn bright, the others dim.
+ * a line of its sections, and under it the parts of the section the row is
+ * at; each travels there on a click, a section also on its digit from the
+ * empty prompt. The section the row is at is drawn bright, the others dim.
  */
 export async function drawIndex(
   $: EngineInterface,
@@ -918,13 +995,22 @@ export async function drawIndex(
   nav: PeekNav,
   picture: PeekPicture,
 ): Promise<JSX.Element | undefined> {
-  const sections = picture.text?.sections ?? []
-  if (sections.length < 2) return undefined
+  const text = picture.text
+  if (text === undefined || !isIndexed(text)) return undefined
   const { Box, Text, Button } = $.ui.resolve(e)
+  const sections = text.sections
   const state = await read($, memberOf(viewAtom, { requestId: nav.requestId }))
-  const layout = layoutOf(state)
-  const tab = Math.min(Math.max(state.tab, 0), sections.length - 1)
-  const isShown = (at: number) => (layout === 'Document' ? true : layout === 'Tabs' ? tab === at : state.open.includes(at))
+  const start = startOf(state, text)
+  // The section the row is at: where travel made it start; in Tabs, the tab
+  // shown; the only one; else none.
+  const current =
+    start?.section ??
+    (layoutOf(state) === 'Tabs' || sections.length === 1 ? Math.min(Math.max(state.tab, 0), sections.length - 1) : undefined)
+  const section = current === undefined ? undefined : sections[current]
+  // Its parts: the headings right under its own.
+  const subs = section?.subs ?? []
+  const level = Math.min(...subs.map(sub => sub.level))
+  const parts = subs.filter(sub => sub.level === level)
   // What the last press came to: why the chat did not scroll, if it did not.
   const said = (deny: string | undefined) =>
     update($, navAtom, now => {
@@ -932,49 +1018,77 @@ export async function drawIndex(
       if (deny === undefined) return now.note === undefined ? now : { row: now.row, requestId: now.requestId }
       return { ...now, note: `could not scroll there: ${deny}` }
     })
+  const go = (to?: PeekPlace) => () => void travelRow($, nav.requestId, to).then(said)
+  const partLine =
+    section === undefined || current === undefined || parts.length === 0
+      ? []
+      : [
+          <Box flexDirection="row" flexWrap="wrap" columnGap={2}>
+            <Text dimColor>{`› ${short(section.title)}:`}</Text>
+            {parts.map((sub, k) => (
+              <Button
+                key={`part-${k}`}
+                plain
+                dimColor={start !== undefined && start.piece > 0 && start.piece !== sub.piece}
+                label={short(sub.title)}
+                onPress={go({ section: current, piece: sub.piece })}
+              />
+            ))}
+          </Box>,
+        ]
   return (
-    <Box flexDirection="row" flexWrap="wrap" columnGap={2}>
-      <Text dimColor>{`${short(picture.title, 32)}:`}</Text>
-      {sections.map((section, at) => (
-        <Button
-          key={`index-${at}`}
-          plain
-          {...(at < 9 ? { hotkey: String(at + 1) } : {})}
-          dimColor={!isShown(at)}
-          label={short(section.title)}
-          onPress={() => void sectionTravel($, nav.requestId, layout, at, isShown(at)).then(said)}
-        />
-      ))}
-      <Button key="index-top" plain dimColor label="▴ top" onPress={() => void scrollTop($, { requestId: nav.requestId }).then(said)} />
-      {nav.note === undefined ? [] : [<Text color="warning">{nav.note}</Text>]}
+    <Box flexDirection="column">
+      <Box flexDirection="row" flexWrap="wrap" columnGap={2}>
+        <Text dimColor>{`${short(picture.title, 32)}:`}</Text>
+        {sections.map((each, at) => (
+          <Button
+            key={`index-${at}`}
+            plain
+            {...(at < 9 ? { hotkey: String(at + 1) } : {})}
+            dimColor={current !== undefined && current !== at}
+            label={short(each.title)}
+            onPress={go({ section: at, piece: 0 })}
+          />
+        ))}
+        <Button key="index-top" plain dimColor label="▴ top" onPress={go()} />
+        {nav.note === undefined ? [] : [<Text color="warning">{nav.note}</Text>]}
+      </Box>
+      {partLine}
     </Box>
   )
 }
 
 /**
- * PROTOTYPE (index): travels a row's page to section `at` as its layout shows
- * sections, and brings the section to the top of the screen. The first scroll
- * answers the press at once; the second lands it once the section shows.
+ * PROTOTYPE (index): travels a row's page to a place: the row starts there,
+ * what comes before it folded into one line, and the chat brings the row's
+ * top to the top of the screen; with no place, the row shows all its page
+ * again. The chat reveals whole rows: it cannot scroll to a heading inside one.
  * Resolves to why the chat did not scroll, if it did not.
  */
-async function sectionTravel(
-  $: EngineInterface,
-  requestId: string,
-  layout: Layout,
-  at: number,
-  isShown: boolean,
-): Promise<string | undefined> {
-  const tag = tagOf(requestId)
-  const to: UiScrollTarget =
-    layout === 'Tabs' ? { requestId } : { key: layout === 'Document' ? `title-${at}-${tag}` : `fold-${at}-${tag}` }
-  const first = scrollTop($, to)
-  if (isShown) return first
-  const deny = await first
+async function travelRow($: EngineInterface, requestId: string, to?: PeekPlace): Promise<string | undefined> {
+  // The row's top stays where it is whatever the row then shows: scroll first.
+  const moved = scrollTop($, { requestId })
   await update($, memberOf(viewAtom, { requestId }), v =>
-    layout === 'Tabs' ? { ...v, tab: at } : v.open.includes(at) ? v : { ...v, open: [...v.open, at] },
+    to === undefined
+      ? withoutStart(v)
+      : { ...v, start: to, tab: to.section, open: v.open.includes(to.section) ? v.open : [...v.open, to.section] },
   )
-  const second = await scrollTop($, to)
-  return deny === undefined ? undefined : second
+  return moved
+}
+
+/** Where travel made a row start, while that is still a place in its page. */
+function startOf(view: PeekView, text: PeekText): PeekPlace | undefined {
+  const place = view.start
+  const section = place === undefined ? undefined : text.sections[place.section]
+  if (place === undefined || section === undefined) return undefined
+  return { section: place.section, piece: Math.min(Math.max(0, place.piece), Math.max(0, section.pieces.length - 1)) }
+}
+
+/** A view with no start: the row shows all its page. */
+function withoutStart(view: PeekView): PeekView {
+  const next = { ...view }
+  delete next.start
+  return next
 }
 
 /** Brings `to` to the top of the screen; resolves to why not, if not. */
@@ -1128,13 +1242,6 @@ function plainOf(runs: readonly Run[]): string {
     .join('')
     .replace(/\s+/g, ' ')
     .trim()
-}
-
-/** A short tag of a row's id, for keys that must be the row's own. */
-function tagOf(id: string): string {
-  let hash = 0
-  for (let at = 0; at < id.length; at++) hash = (Math.imul(hash, 31) + id.charCodeAt(at)) | 0
-  return (hash >>> 0).toString(36)
 }
 
 function short(title: string, most = 24): string {
