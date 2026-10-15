@@ -10,6 +10,7 @@ import type { PeekBand, PeekMode, PeekPicture } from '../types'
 import { fromBase64 } from './base64'
 import { CELL_ASPECT, fitCells, rasterCells } from './picture'
 import { decodePng, readPngHeader, type Pixels, type PngHeader } from './png'
+import { drawText, EXTRACT_SCRIPT, readExtracted, textOf } from './prototype-text'
 
 type Engine = EngineInterface
 
@@ -48,7 +49,8 @@ const MAX_RASTER_ROWS = 256
 const BROWSER_TIMEOUT_MS = 60_000
 const TOOL_TIMEOUT_MS = 60_000
 
-const USAGE = 'Usage: /peek <file> [--blocks|--image]. Shows a PNG, JPEG, WebP, GIF, SVG or HTML page.'
+const USAGE =
+  'Usage: /peek <file> [--text] [--blocks|--image]. Shows a PNG, JPEG, WebP, GIF, SVG or HTML page; --text reads a page as text (prototype).'
 
 const TOOL_DESCRIPTION = [
   'Shows a picture or an HTML page to the person right in the chat, inside their terminal, as a row',
@@ -96,8 +98,8 @@ const KINDS: readonly (readonly [RegExp, Kind])[] = [
 ]
 
 type Found = { path: string; size: number }
-type Made = Pick<PeekPicture, 'kind' | 'file' | 'size' | 'width' | 'height' | 'small' | 'bands' | 'note'>
-type ShowRequest = { row: string; path: string; title?: string; mode?: PeekMode; columns: number }
+type Made = Pick<PeekPicture, 'kind' | 'file' | 'size' | 'width' | 'height' | 'small' | 'bands' | 'note' | 'text'>
+type ShowRequest = { row: string; path: string; title?: string; mode?: PeekMode; view?: 'text'; columns: number }
 type Shown = { text: string; forModel: string }
 
 // What the module learns as it goes; a reload starts it over.
@@ -119,7 +121,7 @@ export const register: Register = (on, options) => {
     await $.command.register({
       name: 'peek',
       description: 'Show a picture or an HTML page in the chat',
-      argumentHint: '<file> [--blocks|--image]',
+      argumentHint: '<file> [--text] [--blocks|--image]',
     })
     await $.tool.register({
       name: 'show',
@@ -140,10 +142,10 @@ export const register: Register = (on, options) => {
   })
 
   on('command.run', { command: 'peek' }, async ($, e) => {
-    const { path, mode } = parseArgs(e.args)
+    const { path, mode, view } = parseArgs(e.args)
     if (path === '') return { text: USAGE }
     try {
-      const shown = await show($, configured, { row: commandRow(e.args), path, mode, columns: e.presentation.columns })
+      const shown = await show($, configured, { row: commandRow(e.args), path, mode, view, columns: e.presentation.columns })
 
       return { text: shown.text, context: [shown.forModel] }
     } catch (error) {
@@ -213,11 +215,15 @@ async function drawRow($: Engine, e: RenderInput, picture: PeekPicture, configur
   const remote = await remoteSession($)
   const drawsImage = mode === 'image' && (!remote || picture.size <= MAX_PNG_SOURCE)
   const isPage = picture.kind === 'page'
+  const text = picture.text // PROTOTYPE (native-text)
 
-  const facts = [`${picture.width}×${picture.height}`, isPage ? 'page' : 'picture', drawsImage ? 'full color' : 'blocks']
+  const facts =
+    text === undefined
+      ? [`${picture.width}×${picture.height}`, isPage ? 'page' : 'picture', drawsImage ? 'full color' : 'blocks']
+      : ['page as text', `${text.sections.length} sections`, `${text.figures.length} figures`, 'prototype']
   if (picture.note !== undefined) facts.push(picture.note)
-  if (mode === 'image' && !drawsImage) facts.push('too big to send over ssh')
-  if (drawsImage && picture.madeFor === 'blocks') facts.push('few pixels: /peek it again')
+  if (text === undefined && mode === 'image' && !drawsImage) facts.push('too big to send over ssh')
+  if (text === undefined && drawsImage && picture.madeFor === 'blocks') facts.push('few pixels: /peek it again')
   const toggle = (
     <Button
       key="toggle"
@@ -229,6 +235,19 @@ async function drawRow($: Engine, e: RenderInput, picture: PeekPicture, configur
   if (!open) return toggle
 
   let body: JSX.Element
+  if (text !== undefined) {
+    try {
+      body = await drawText($, e, picture, text, { columns, drawsImage: mode === 'image' && !remote })
+    } catch (error) {
+      body = <Text color="red">{`Cannot draw ${picture.title}: ${messageOf(error)}`}</Text>
+    }
+    return (
+      <Box flexDirection="column">
+        {toggle}
+        {body}
+      </Box>
+    )
+  }
   try {
     const bands = drawsImage && !remote ? picture.bands : undefined
     if (bands !== undefined) {
@@ -299,7 +318,7 @@ async function show($: Engine, configured: PeekMode | undefined, request: ShowRe
   const name = found.path.slice(found.path.lastIndexOf('/') + 1)
   const title = request.title?.trim() || name
   const mode = request.mode ?? configured ?? (await terminalMode($))
-  const made = await load($, found, mode, Math.max(10, request.columns - 2))
+  const made = await load($, found, mode, Math.max(10, request.columns - 2), request.view)
 
   await update($, shownAtom, shown => {
     const generation = Math.max(0, ...Object.values(shown).map(picture => picture.generation)) + 1
@@ -310,10 +329,12 @@ async function show($: Engine, configured: PeekMode | undefined, request: ShowRe
   })
 
   const what =
-    made.kind === 'page'
-      ? `a ${made.width}×${made.height} snapshot of the page`
-      : `${made.width}×${made.height}`
-  const how = mode === 'image' ? 'in full color' : 'as colored blocks'
+    made.text !== undefined
+      ? `the page as text: ${made.text.sections.length} sections, ${made.text.figures.length} figures`
+      : made.kind === 'page'
+        ? `a ${made.width}×${made.height} snapshot of the page`
+        : `${made.width}×${made.height}`
+  const how = made.text !== undefined ? 'in a layout the person can switch' : mode === 'image' ? 'in full color' : 'as colored blocks'
   const note = made.note === undefined ? '' : ` (${made.note})`
 
   return {
@@ -322,7 +343,7 @@ async function show($: Engine, configured: PeekMode | undefined, request: ShowRe
   }
 }
 
-async function load($: Engine, found: Found, mode: PeekMode, columns: number): Promise<Made> {
+async function load($: Engine, found: Found, mode: PeekMode, columns: number, view?: 'text'): Promise<Made> {
   let kind = KINDS.find(([pattern]) => pattern.test(found.path))?.[1]
   if (kind === undefined) {
     const header = await pngHeaderOf($, found).catch(() => undefined)
@@ -330,7 +351,7 @@ async function load($: Engine, found: Found, mode: PeekMode, columns: number): P
   }
   switch (kind) {
     case 'page':
-      return snapshotPage($, found, mode, columns)
+      return view === 'text' ? textPage($, found, mode, columns) : snapshotPage($, found, mode, columns)
     case 'svg':
       return pictureViaBrowser($, found, mode, { vectorColumns: columns })
     case 'png':
@@ -423,6 +444,50 @@ async function snapshotPage($: Engine, found: Found, mode: PeekMode, columns: nu
   const bands = mode === 'image' ? await cutBands($, made, `${dir}/band-${id}`) : undefined
   if (bands !== undefined) made.bands = bands
   return made
+}
+
+/**
+ * PROTOTYPE (native-text): the page read as text by Chrome, laid out as wide
+ * as for a snapshot; in image mode its figures are cut from a snapshot of
+ * the same copy at the same width, so their boxes line up.
+ */
+async function textPage($: Engine, found: Found, mode: PeekMode, columns: number): Promise<Made> {
+  if (found.size > MAX_READ) throw new Error('reading a page as text takes a page under 4 MiB')
+  const chrome = await needBrowser($)
+  const dir = await cacheOf($)
+  const id = hashOf(found.path)
+  const panePx = columns * CELL_PX
+  const width = clamp(Math.round(panePx), MIN_PAGE_WIDTH, PAGE_WIDTH)
+  const copy = `${dir}/text-${id}.html`
+  await $.fs.write(copy, withBase(await $.fs.read(found.path), directoryUrl(found.path)) + EXTRACT_SCRIPT)
+  const ran = await runBrowser($, chrome, [`--window-size=${width},${MEASURE_HEIGHT}`, '--dump-dom', fileUrl(copy)])
+  const page = readExtracted(ran.stdout)
+  const { text, boxes } = textOf(page, width)
+  const [pageWidth, pageHeight] = page.size
+
+  const tool = boxes.length > 0 && mode === 'image' ? await findMagick($) : null
+  if (tool !== null) {
+    const height = clamp(pageHeight, 50, MAX_PAGE_HEIGHT)
+    const scale = shotScale(mode, panePx, width, height)
+    const shot = `${dir}/text-${id}.png`
+    await shoot($, chrome, shot, [`--force-device-scale-factor=${scale}`, `--window-size=${width},${height}`], fileUrl(copy), false)
+    for (const [at, box] of boxes.entries()) {
+      const figure = text.figures[at]
+      if (figure === undefined || box.w < 1 || box.h < 1 || box.y + box.h > height) continue
+      const out = `${dir}/text-${id}-${at}.png`
+      const crop = `${Math.ceil(box.w * scale)}x${Math.ceil(box.h * scale)}+${Math.floor(box.x * scale)}+${Math.floor(box.y * scale)}`
+      try {
+        const cut = await $.process.run([...tool, shot, '-crop', crop, '+repage', `PNG32:${out}`], { timeoutMs: TOOL_TIMEOUT_MS })
+        if (cut.exitCode !== 0) continue
+        const made = await statOf($, out)
+        const header = await pngHeaderOf($, made)
+        Object.assign(figure, { file: out, size: made.size, width: header.width, height: header.height })
+      } catch {
+        continue
+      }
+    }
+  }
+  return { kind: 'page', file: found.path, size: found.size, width: pageWidth, height: pageHeight, text }
 }
 
 /**
@@ -690,17 +755,22 @@ async function removeFile($: Engine, path: string): Promise<void> {
   await $.process.run(['rm', '-f', path])
 }
 
-/** `/peek` arguments: a path, quoted or not, and `--blocks` or `--image` anywhere. */
-export function parseArgs(args: string): { path: string; mode?: PeekMode } {
+/** `/peek` arguments: a path, quoted or not, and `--blocks`, `--image` or `--text` anywhere. */
+export function parseArgs(args: string): { path: string; mode?: PeekMode; view?: 'text' } {
   let mode: PeekMode | undefined
-  const rest = args.replace(/(^|\s)--(blocks|image)(?=\s|$)/g, (_, space: string, flag: PeekMode) => {
-    mode = flag
+  let view: 'text' | undefined
+  const rest = args.replace(/(^|\s)--(blocks|image|text)(?=\s|$)/g, (_, space: string, flag: PeekMode | 'text') => {
+    if (flag === 'text') view = flag
+    else mode = flag
     return space
   })
   let path = rest.trim()
   const quote = path[0]
   if (path.length >= 2 && (quote === '"' || quote === "'") && path.endsWith(quote)) path = path.slice(1, -1)
-  return mode === undefined ? { path } : { path, mode }
+  const parsed: { path: string; mode?: PeekMode; view?: 'text' } = { path }
+  if (mode !== undefined) parsed.mode = mode
+  if (view !== undefined) parsed.view = view
+  return parsed
 }
 
 /** The page with a <base> naming its folder, so a copy elsewhere finds its files. */

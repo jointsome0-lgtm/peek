@@ -34,7 +34,33 @@ export type PeekPicture = {
   note?: string
   /** Counts up with every picture shown, so a redraw never reuses an old one. */
   generation: number
+  /** PROTOTYPE (native-text): the page read as terminal text, for `/peek <page> --text`. */
+  text?: PeekText
 }
+
+/** PROTOTYPE (native-text): one piece of a page shown as text: markdown, or a figure by its index. */
+export type PeekPiece = { markdown: string } | { figure: number }
+
+/** PROTOTYPE (native-text): a figure of the page, cut from a snapshot of it where that worked. */
+export type PeekFigure = {
+  /** What the page says the figure shows; drawn where the figure cannot be. */
+  alt: string
+  /** The figure's width over the page's: how much of the chat's width it takes. */
+  share: number
+  file?: string
+  size?: number
+  width?: number
+  height?: number
+}
+
+/** PROTOTYPE (native-text): the part of a page under one of its headings. */
+export type PeekSection = { title: string; pieces: PeekPiece[] }
+
+/** PROTOTYPE (native-text): a page as text: what comes before its first heading, then its sections. */
+export type PeekText = { intro: PeekPiece[]; sections: PeekSection[]; figures: PeekFigure[] }
+
+/** PROTOTYPE (native-text): how a row shows its text: the layout picked, open sections, the tab shown. */
+export type PeekView = { variant: number; open: number[]; tab: number }
 
 declare module 'claude-code' {
   interface PluginState {
@@ -43,6 +69,8 @@ declare module 'claude-code' {
       shown: Record<string, PeekPicture>
       /** Whether a row's picture is unfolded. */
       isOpen: StateFamily<boolean>
+      /** PROTOTYPE (native-text): how each row shows a page as text. */
+      view: StateFamily<PeekView>
     }
   }
 }
