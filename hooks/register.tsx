@@ -6,20 +6,20 @@
 import { atom, memberOf, read, update } from 'claude-code'
 import type { EngineInterface, ImageSource, ProcessRunResult, Register, RenderInput } from 'claude-code'
 
-import type { PeekBand, PeekMode, PeekPicture } from '../types'
+import type { PeekBand, PeekLive, PeekMode, PeekPicture } from '../types'
 import { fromBase64 } from './base64'
 import { CELL_ASPECT, fitCells, rasterCells } from './picture'
 import { decodePng, readPngHeader, type Pixels, type PngHeader } from './png'
 import { actLive, closeLive, openLive } from './prototype-live'
-import { claimIndex, drawIndex, drawText, EXTRACT_SCRIPT, isIndexed, readExtracted, textOf, type LiveAction } from './prototype-text'
+import { drawIndex, drawReader, EXTRACT_SCRIPT, openReader, READER_PANE, readExtracted, textOf, type LiveAction } from './prototype-text'
 
 type Engine = EngineInterface
 
 const TOOL = 'mcp__peek__show'
 const shownAtom = atom({ plugin: 'peek', key: 'shown' } as const, {})
 const isOpenAtom = atom({ plugin: 'peek', key: 'isOpen' } as const, false)
-/** PROTOTYPE (index): the row whose page the band above the prompt indexes; the scan wants it named here too. */
-const navAtom = atom({ plugin: 'peek', key: 'nav' } as const, null)
+/** PROTOTYPE (reader): the page the reader pane shows; the scan wants it named here too. */
+const readerAtom = atom({ plugin: 'peek', key: 'reader' } as const, null)
 
 /** Rows past this many lose their pictures, oldest first, and draw as text. */
 const MAX_SHOWN = 30
@@ -105,7 +105,7 @@ type Made = Pick<PeekPicture, 'kind' | 'file' | 'size' | 'width' | 'height' | 's
 type ShowRequest = { row: string; path: string; title?: string; mode?: PeekMode; view?: ViewKind; columns: number }
 /** PROTOTYPE: a page read as text, or kept open live. */
 type ViewKind = 'text' | 'live'
-type Shown = { text: string; forModel: string }
+type Shown = { text: string; forModel: string; title: string; isText: boolean }
 
 // What the module learns as it goes; a reload starts it over.
 let detectedMode: PeekMode | undefined
@@ -142,6 +142,9 @@ export const register: Register = (on, options) => {
       },
       isDeferred: false,
     })
+    // PROTOTYPE (reader): a reader closed while the module was away leaves no page behind.
+    const panes = await $.ui.panes().catch(() => [])
+    if (!panes.some(pane => pane.id === READER_PANE)) await update($, readerAtom, now => (now === null ? now : null))
 
     return next(e)
   })
@@ -150,7 +153,15 @@ export const register: Register = (on, options) => {
     const { path, mode, view } = parseArgs(e.args)
     if (path === '') return { text: USAGE }
     try {
-      const shown = await show($, configured, { row: commandRow(e.args), path, mode, view, columns: e.presentation.columns })
+      const row = commandRow(e.args)
+      const shown = await show($, configured, { row, path, mode, view, columns: e.presentation.columns })
+      // PROTOTYPE (reader): a page as text opens in the reader pane beside the chat.
+      if (shown.isText) {
+        const opened = await openReader($, row, shown.title)
+        if (!opened.isPlaced) {
+          return { text: `${shown.text}; the reader waits: ${opened.reason}`, context: [`${shown.forModel} The reader waits: ${opened.reason}.`] }
+        }
+      }
 
       return { text: shown.text, context: [shown.forModel] }
     } catch (error) {
@@ -196,16 +207,60 @@ export const register: Register = (on, options) => {
     return drawRow($, e, picture, configured, row)
   })
 
-  // PROTOTYPE (index): the sections of the page unfolded last, in the band
-  // above the prompt, while its row stays unfolded.
+  // PROTOTYPE (reader): the page read beside the chat, whole and never folded.
+  on('ui.render', { component: 'Pane', requestId: READER_PANE }, async ($, e) => {
+    const reader = await read($, readerAtom)
+    const picture = reader === null ? undefined : (await read($, shownAtom))[reader.row]
+    const { Text } = $.ui.resolve(e)
+    if (reader === null || picture?.text === undefined) {
+      return <Text dimColor>Nothing to read: /peek a page with --text or --live.</Text>
+    }
+    try {
+      const mode = picture.mode ?? configured ?? (await terminalMode($))
+      const live = picture.live
+      return await drawReader($, e, picture, picture.text, {
+        columns: e.props.bodyColumns,
+        endRows: e.props.placement === 'dock' ? Math.max(0, e.props.scroll.bodyRows - 2) : 0,
+        drawsImage: mode === 'image' && !(await remoteSession($)),
+        act: live === undefined ? undefined : liveAct($, reader.row, live),
+      })
+    } catch (error) {
+      return <Text color="red">{`Cannot draw ${picture.title}: ${messageOf(error)}`}</Text>
+    }
+  })
+
+  // PROTOTYPE (reader): the reader closed, its page and the band go too.
+  on('ui.close', { id: READER_PANE }, async ($, e, next) => {
+    const closed = await next(e)
+    await update($, readerAtom, () => null)
+    return closed
+  }).catch(($, e, next) => next(e))
+
+  // PROTOTYPE (index): the sections of the page in the reader, in the band
+  // above the prompt, while the reader is open.
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (e.surface !== 'terminal' || e.props.hasSurvey || e.props.view.agentId !== undefined) return next(e)
-    const nav = await read($, navAtom)
-    if (nav === null) return next(e)
-    const picture = (await read($, shownAtom))[nav.row]
-    if (picture === undefined || !(await read($, memberOf(isOpenAtom, { requestId: nav.requestId })))) return next(e)
-    return (await drawIndex($, e, nav, picture)) ?? next(e)
+    const reader = await read($, readerAtom)
+    if (reader === null) return next(e)
+    const picture = (await read($, shownAtom))[reader.row]
+    if (picture === undefined) return next(e)
+    return (await drawIndex($, e, reader, picture)) ?? next(e)
   })
+}
+
+/** PROTOTYPE (live text): a press works in the page, then the reader shows it anew. */
+function liveAct($: Engine, row: string, live: PeekLive) {
+  return async (action: LiveAction) => {
+    const done = await actLive($, live, action)
+    await update($, shownAtom, shown => {
+      const old = shown[row]
+      if (old === undefined) return shown
+      const generation = Math.max(0, ...Object.values(shown).map(each => each.generation)) + 1
+      const [width, height] = done.size
+      return { ...shown, [row]: { ...old, text: done.text, live: done.live, width, height, generation } }
+    })
+    return done.notice
+  }
 }
 
 function commandRow(args: string): string {
@@ -244,51 +299,31 @@ async function drawRow($: Engine, e: RenderInput, picture: PeekPicture, configur
   if (picture.note !== undefined) facts.push(picture.note)
   if (text === undefined && mode === 'image' && !drawsImage) facts.push('too big to send over ssh')
   if (text === undefined && drawsImage && picture.madeFor === 'blocks') facts.push('few pixels: /peek it again')
+  // PROTOTYPE (reader): a page as text is read in the pane beside the chat;
+  // its row is one line that opens it there.
+  if (text !== undefined) {
+    const reader = await read($, readerAtom)
+    const isRead = reader !== null && reader.row === row
+    return (
+      <Button
+        key="reader"
+        plain
+        label={`${isRead ? '▸' : '▹'} ${picture.title} · ${facts.join(' · ')} · ${isRead ? 'in the reader beside the chat' : 'click to read it beside the chat'}`}
+        onPress={() => void openReader($, row, picture.title)}
+      />
+    )
+  }
   const toggle = (
     <Button
       key="toggle"
       plain
       label={`${open ? '▾' : '▸'} ${picture.title} · ${facts.join(' · ')}${open ? '' : ' · click to unfold'}`}
-      onPress={() => {
-        void update($, isOpen, value => !value)
-        // PROTOTYPE (index): the band above the prompt indexes the page unfolded last.
-        if (text !== undefined && isIndexed(text)) claimIndex($, row, e.requestId)
-      }}
+      onPress={() => void update($, isOpen, value => !value)}
     />
   )
   if (!open) return toggle
 
   let body: JSX.Element
-  if (text !== undefined) {
-    try {
-      const live = picture.live
-      // PROTOTYPE (live text): a press works in the page, then the row shows it anew.
-      const act =
-        live === undefined
-          ? undefined
-          : async (action: LiveAction) => {
-              const done = await actLive($, live, action)
-              await update($, shownAtom, shown => {
-                const old = shown[row]
-                if (old === undefined) return shown
-                const generation = Math.max(0, ...Object.values(shown).map(each => each.generation)) + 1
-                const [width, height] = done.size
-                return { ...shown, [row]: { ...old, text: done.text, live: done.live, width, height, generation } }
-              })
-              return done.notice
-            }
-      const claim = () => claimIndex($, row, e.requestId)
-      body = await drawText($, e, picture, text, { columns, drawsImage: mode === 'image' && !remote, act, claim })
-    } catch (error) {
-      body = <Text color="red">{`Cannot draw ${picture.title}: ${messageOf(error)}`}</Text>
-    }
-    return (
-      <Box flexDirection="column">
-        {toggle}
-        {body}
-      </Box>
-    )
-  }
   try {
     const bands = drawsImage && !remote ? picture.bands : undefined
     if (bands !== undefined) {
@@ -380,19 +415,17 @@ async function show($: Engine, configured: PeekMode | undefined, request: ShowRe
       : made.kind === 'page'
         ? `a ${made.width}×${made.height} snapshot of the page`
         : `${made.width}×${made.height}`
-  const how =
-    made.live !== undefined
-      ? 'as text whose buttons and fields work, in a layout the person can switch'
-      : made.text !== undefined
-        ? 'in a layout the person can switch'
-        : mode === 'image'
-          ? 'in full color'
-          : 'as colored blocks'
+  const how = made.live !== undefined ? 'as text whose buttons and fields work' : mode === 'image' ? 'in full color' : 'as colored blocks'
   const note = made.note === undefined ? '' : ` (${made.note})`
 
   return {
     text: `${title}, ${what}${note}`,
-    forModel: `The person sees ${title} in the chat, ${what}, ${how}${note}, folded: they unfold it with a click.`,
+    forModel:
+      made.text !== undefined
+        ? `The person reads ${title} in a reader pane beside the chat, ${what}${made.live !== undefined ? `, ${how}` : ''}${note}; the band above the prompt scrolls it to a section.`
+        : `The person sees ${title} in the chat, ${what}, ${how}${note}, folded: they unfold it with a click.`,
+    title,
+    isText: made.text !== undefined,
   }
 }
 

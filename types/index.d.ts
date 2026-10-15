@@ -86,10 +86,10 @@ export type PeekLive = {
 }
 
 /**
- * PROTOTYPE (index): the row whose page the band above the prompt indexes:
- * its key in `shown`, its render instance, and what the last press came to.
+ * PROTOTYPE (reader): the page the reader pane shows: its row's key in
+ * `shown`, the section the index last went to, and why a scroll failed.
  */
-export type PeekNav = { row: string; requestId: string; note?: string }
+export type PeekReader = { row: string; at?: number; note?: string }
 
 /** PROTOTYPE (native-text): a figure of the page, cut from a snapshot of it where that worked. */
 export type PeekFigure = {
@@ -109,24 +109,11 @@ export type PeekSub = { title: string; level: number; piece: number }
 /** PROTOTYPE (native-text): the part of a page under one of its headings, and the headings under that one. */
 export type PeekSection = { title: string; pieces: PeekPiece[]; subs?: PeekSub[] }
 
-/** PROTOTYPE (index): a place in a page: a section, and a piece of it. */
-export type PeekPlace = { section: number; piece: number }
-
 /** PROTOTYPE (native-text): a page as text: what comes before its first heading, then its sections. */
 export type PeekText = { intro: PeekPiece[]; sections: PeekSection[]; figures: PeekFigure[]; controls?: PeekControl[] }
 
-/**
- * PROTOTYPE (native-text): how a row shows its text: the layout picked, open
- * sections, the tab shown, whether the text sits at the chat's left rather
- * than in its middle, where travel made the row start (what comes before
- * folds into one line); whether a press is under way and what the last one said.
- */
+/** PROTOTYPE (live text): whether a press in the reader is under way, and what the last one said. */
 export type PeekView = {
-  variant: number
-  open: number[]
-  tab: number
-  left?: boolean
-  start?: PeekPlace
   busy?: boolean
   error?: string
   notice?: string
@@ -139,10 +126,10 @@ declare module 'claude-code' {
       shown: Record<string, PeekPicture>
       /** Whether a row's picture is unfolded. */
       isOpen: StateFamily<boolean>
-      /** PROTOTYPE (native-text): how each row shows a page as text. */
+      /** PROTOTYPE (live text): the reader's presses, by the pane they were made in. */
       view: StateFamily<PeekView>
-      /** PROTOTYPE (index): the row whose page the band above the prompt indexes, while it is unfolded. */
-      nav: PeekNav | null
+      /** PROTOTYPE (reader): the page the reader pane shows, while it is open. */
+      reader: PeekReader | null
     }
   }
 }

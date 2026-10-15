@@ -1,49 +1,49 @@
-// PROTOTYPE (native-text branch, throwaway). A page shown in the chat as real
-// terminal text instead of one big picture: headings, paragraphs, lists,
-// tables and code drawn by the engine's Markdown element, figures cut from a
-// snapshot of the page; with --live, the page's own controls drawn as the
-// terminal's buttons, fields and lists, working in a page kept open.
+// PROTOTYPE (native-text branch, throwaway). A page read as real terminal
+// text instead of one big picture: headings, paragraphs, lists, tables and
+// code drawn by the engine's Markdown element, figures cut from a snapshot of
+// the page; with --live, the page's own controls drawn as the terminal's
+// buttons, fields and lists, working in a page kept open.
 //
-// Question: does a page read well in the chat as text, and which layout feels
-// right: Outline (folded sections), Document (all of it) or Tabs (one section
-// at a time)? Centered or at the left? Does an index of its sections in the
-// band above the prompt make travel quick, and do two levels of it (sections,
-// then the parts of one) serve a big page? With --live: does using the page
-// from the chat feel right?
+// Question: does reading a page in a reader pane beside the chat, whole and
+// never folded, with an index above the prompt that scrolls it to a section
+// or a part of one, feel right? With --live: does using the page from the
+// reader feel right?
 //
-// Run: /peek <page.html> --text (or --live), unfold the row, flip layouts with
-// ◂ and ▸, and the column with center and left; travel with the band.
-// prototype/deep-demo.html is a big page to travel.
+// Run: /peek <page.html> --text (or --live). The page opens in the reader
+// beside the chat; the band above the prompt jumps to a section, then to a
+// part of it, and the wheel scrolls on from there. The chat keeps one line
+// that opens the reader again. prototype/deep-demo.html is a big page.
 // This file never merges; the decision lands on main, rewritten with tests.
 
 import { atom, memberOf, read, update } from 'claude-code'
-import type { EngineInterface, RenderInput, UiScrollTarget } from 'claude-code'
+import type { EngineInterface, RenderInput, UiOpenResult, UiScrollTarget } from 'claude-code'
 
 import type {
   PeekControl,
   PeekFigure,
-  PeekNav,
   PeekPicture,
   PeekPiece,
-  PeekPlace,
+  PeekReader,
   PeekRowItem,
   PeekRun,
   PeekSection,
   PeekSub,
   PeekText,
-  PeekView,
 } from '../types'
 import { fromBase64 } from './base64'
 import { fitCells } from './picture'
 
-const VARIANTS = ['Outline', 'Document', 'Tabs'] as const
-const viewAtom = atom({ plugin: 'peek', key: 'view' } as const, { variant: 0, open: [0], tab: 0 })
-/** PROTOTYPE (index): the row whose page the band above the prompt indexes. */
-const navAtom = atom({ plugin: 'peek', key: 'nav' } as const, null)
-type Layout = (typeof VARIANTS)[number]
+/** PROTOTYPE (reader): the pane a page is read in, beside the chat. */
+export const READER_PANE = 'peek-reader'
+/** PROTOTYPE (live text): a press in the reader under way, and what the last one said. */
+const viewAtom = atom({ plugin: 'peek', key: 'view' } as const, {})
+/** PROTOTYPE (reader): the page the reader shows. */
+const readerAtom = atom({ plugin: 'peek', key: 'reader' } as const, null)
 const MAX_IMAGE = 255
-/** The widest the text runs, in columns: a column to read, centered or at the left. */
+/** The widest the text runs, in columns. */
 const READ_COLUMNS = 100
+/** The body columns the reader asks for beside the chat: a column of text and its margins. */
+const READER_COLUMNS = 92
 const LINKABLE = /^(https?|file):/i
 
 type Run = PeekRun
@@ -644,26 +644,45 @@ function lift(blocks: readonly Block[]): Block[] {
   return out
 }
 
-export type TextHow = {
+export type ReaderHow = {
+  /** The body's columns, inside the pane's frame. */
   columns: number
+  /** Blank rows after the page's end, so its last section can come to the top. */
+  endRows: number
   drawsImage: boolean
   /**
    * PROTOTYPE (live text): does in the live page what a press asks and shows
-   * the page again; resolves to a note for the row, if any. Absent, the
+   * the page again; resolves to a note for the reader, if any. Absent, the
    * page's controls are drawn as text.
    */
   act?: (action: LiveAction) => Promise<string | undefined>
-  /** PROTOTYPE (index): makes this row's page the one the band above the prompt indexes. */
-  claim?: () => void
 }
 
-/** The unfolded row: the prototype's layout switcher, then the page in the layout picked. */
-export async function drawText(
+/** PROTOTYPE (reader): shows a row's page in the reader pane beside the chat; a new page from its top. */
+export async function openReader($: EngineInterface, row: string, title: string): Promise<UiOpenResult> {
+  let isNew = false as boolean
+  await update($, readerAtom, now => {
+    isNew = now === null || now.row !== row
+    return isNew ? { row } : now
+  })
+  if (isNew) await update($, memberOf(viewAtom, { requestId: READER_PANE }), () => ({}))
+  const opened = await $.ui.open({ id: READER_PANE, title, columns: READER_COLUMNS })
+  if (isNew && opened.isPlaced) await scrollReader($, 'start')
+  return opened
+}
+
+/**
+ * PROTOTYPE (reader): the page in the reader pane, whole and never folded: a
+ * line naming it, the intro, each section under its heading, then its end.
+ * Each section, and each part of one (a heading under the section's own),
+ * sits in a keyed box the index above the prompt scrolls to.
+ */
+export async function drawReader(
   $: EngineInterface,
   e: RenderInput,
   picture: PeekPicture,
   text: PeekText,
-  how: TextHow,
+  how: ReaderHow,
 ): Promise<JSX.Element> {
   if (e.surface !== 'terminal') {
     const { Text } = $.ui.resolve(e)
@@ -672,15 +691,9 @@ export async function drawText(
   const { Box, Text, Button, Markdown, Image, Input, Select, Link } = $.ui.resolve(e)
   const view = memberOf(viewAtom, e)
   const state = await read($, view)
-  const change = (next: (view: PeekView) => PeekView) => () => void update($, view, next)
-  const count = VARIANTS.length
-  const variant = ((state.variant % count) + count) % count
-  const sections = text.sections
   const controls = text.controls ?? []
   const act = how.act
-  const left = state.left === true
-  const wide = Math.min(how.columns, READ_COLUMNS)
-  const start = startOf(state, text)
+  const wide = Math.max(10, Math.min(how.columns - 2, READ_COLUMNS))
 
   // A press says the page is working, asks the page, then says what came of it.
   const press = (action: LiveAction) => {
@@ -696,16 +709,6 @@ export async function drawText(
       }
       await update($, view, v => ({ ...v, busy: false, error, notice }))
     })()
-  }
-
-  // Travel: the row starts at a place, or with none at its top again, and the
-  // chat brings the row's top to the top of the screen.
-  const travel = (to?: PeekPlace) => () => {
-    how.claim?.()
-    void travelRow($, e.requestId, to).then(deny => {
-      const notice = deny === undefined ? '' : `could not scroll there: ${deny}`
-      return update($, view, v => ((v.notice ?? '') === notice ? v : { ...v, notice }))
-    })
   }
 
   const figure = (index: number, key: string): JSX.Element => {
@@ -783,192 +786,50 @@ export async function drawText(
       {items.map(item => ('control' in item ? control(item.control) : <Text>{item.text.map(styled)}</Text>))}
     </Box>
   )
-  // The pieces of a list from the piece `from` on, keyed by their places in it.
-  const pieces = (list: readonly PeekPiece[], key: string, from = 0): JSX.Element[] =>
-    list.slice(from).map((piece, k) =>
-      'markdown' in piece ? (
-        <Markdown key={`${key}-${from + k}`} text={piece.markdown} />
-      ) : 'row' in piece ? (
-        row(piece.row)
-      ) : (
-        figure(piece.figure, `${key}-${from + k}`)
-      ),
-    )
-  const heading = (title: string, key: string) => <Markdown key={key} text={`## ${escapeMarkdown(title)}`} />
-
-  // Where travel made the row start: what comes before folds into one line,
-  // and a section shown from a part of it gets a line back to its top.
-  const intro = text.intro.length === 0 ? [] : ['intro']
-  const before = (at: number) => [...intro, ...sections.slice(0, at).map(section => section.title)]
-  const above = (names: readonly string[]): JSX.Element[] =>
-    start === undefined || names.length === 0
-      ? []
-      : [<Button key="above" plain dimColor label={short(`▴ above: ${names.join(' · ')}`, wide)} onPress={travel()} />]
-  const startPiece = (at: number) => (start !== undefined && start.section === at ? start.piece : 0)
-  const earlier = (at: number): JSX.Element[] =>
-    startPiece(at) === 0
-      ? []
-      : [
-          <Button
-            key={`earlier-${at}`}
-            plain
-            dimColor
-            label={`▴ earlier in ${short(sections[at]?.title ?? '')}`}
-            onPress={travel({ section: at, piece: 0 })}
-          />,
-        ]
-
-  // Outline: the intro, then one folding row per section; the first starts
-  // open, and each open one ends in a way back and a way on. The band above
-  // the prompt indexes the sections.
-  const travels = sections.length > 1
-  const outline = () => {
-    const first = start?.section ?? 0
+  const piece = (one: PeekPiece, key: string): JSX.Element =>
+    'markdown' in one ? <Markdown key={key} text={one.markdown} /> : 'row' in one ? row(one.row) : figure(one.figure, key)
+  // A section under its heading; a piece that starts a part of it sits in a
+  // box under the part's key.
+  const section = (each: PeekSection, at: number): JSX.Element => {
+    const starts = new Set((each.subs ?? []).map(sub => sub.piece))
     return (
-      <Box flexDirection="column">
-        {start === undefined ? (
-          <Box flexDirection="column" gap={1} marginBottom={1}>
-            {pieces(text.intro, 'intro')}
-          </Box>
-        ) : (
-          above(before(first))
-        )}
-        {sections.slice(first).map((section, k) => {
-          const at = first + k
-          const isOpen = state.open.includes(at)
-          const toggle = (
-            <Button
-              key={`fold-${at}`}
-              plain
-              onPress={change(v => ({ ...v, open: v.open.includes(at) ? v.open.filter(one => one !== at) : [...v.open, at] }))}
-            >
-              {isOpen ? '▾ ' : '▸ '}
-              <Text weight="bold">{section.title}</Text>
-            </Button>
-          )
-          if (!isOpen) return toggle
-          const back = sections[at - 1]
-          const on = sections[at + 1]
-          const ways = !travels
-            ? []
-            : [
-                <Box flexDirection="row" flexWrap="wrap" columnGap={3}>
-                  {back === undefined
-                    ? []
-                    : [<Button key={`back-${at}`} plain dimColor label={`◂ ${short(back.title)}`} onPress={travel({ section: at - 1, piece: 0 })} />]}
-                  {on === undefined
-                    ? []
-                    : [<Button key={`next-${at}`} plain label={`${short(on.title)} ▸`} onPress={travel({ section: at + 1, piece: 0 })} />]}
-                </Box>,
-              ]
-          return (
-            <Box flexDirection="column">
-              {toggle}
-              <Box flexDirection="column" gap={1} paddingLeft={2} marginTop={1} marginBottom={1}>
-                {earlier(at)}
-                {pieces(section.pieces, `s${at}`, startPiece(at))}
-                {ways}
-              </Box>
+      <Box key={sectionKey(at)} flexDirection="column" gap={1}>
+        <Markdown key={`title-${at}`} text={`## ${escapeMarkdown(each.title)}`} />
+        {each.pieces.map((one, k) =>
+          starts.has(k) ? (
+            <Box key={partKey(at, k)} flexDirection="column">
+              {piece(one, `s${at}-${k}`)}
             </Box>
-          )
-        })}
-        <Box flexDirection="row" gap={3} marginTop={1}>
-          <Button key="unfold-all" plain dimColor label="unfold all" onPress={change(v => ({ ...v, open: sections.map((_, k) => k) }))} />
-          <Button key="fold-all" plain dimColor label="fold all" onPress={change(v => ({ ...v, open: [] }))} />
-        </Box>
+          ) : (
+            piece(one, `s${at}-${k}`)
+          ),
+        )}
       </Box>
     )
   }
 
-  // Document: everything at once, as a reply of Claude's reads.
-  const linear = () => {
-    const first = start?.section ?? 0
-    return (
-      <Box flexDirection="column" gap={1}>
-        {start === undefined ? pieces(text.intro, 'intro') : above(before(first))}
-        {sections
-          .slice(first)
-          .flatMap((section, k) => [
-            heading(section.title, `title-${first + k}`),
-            ...earlier(first + k),
-            ...pieces(section.pieces, `s${first + k}`, startPiece(first + k)),
-          ])}
-      </Box>
-    )
-  }
-
-  // Tabs: a bar of numbered sections and one section at a time.
-  const tabs = () => {
-    const last = sections.length - 1
-    if (last < 0) return linear()
-    const tab = Math.min(Math.max(state.tab, 0), last)
-    const section = sections[tab]!
-    // A tab picked from the bar shows from its top, and the intro stays as it is.
-    const go = (to: number) => change(v => (v.start === undefined ? { ...v, tab: to } : { ...v, tab: to, start: { section: to, piece: 0 } }))
-    const back = sections[tab - 1]
-    const on = sections[tab + 1]
-    return (
-      <Box flexDirection="column" gap={1}>
-        {start === undefined ? pieces(text.intro, 'intro') : above(intro)}
-        <Box flexDirection="row" flexWrap="wrap" columnGap={1}>
-          {sections.map((s, at) =>
-            at === tab ? (
-              <Button key={`tab-${at}`} variant="primary" label={`${at + 1} ${short(s.title)}`} onPress={go(at)} />
-            ) : (
-              <Button key={`tab-${at}`} dimColor label={`${at + 1} ${short(s.title)}`} onPress={go(at)} />
-            ),
-          )}
-        </Box>
-        {heading(section.title, 'tab-title')}
-        {earlier(tab)}
-        {pieces(section.pieces, `t${tab}`, startPiece(tab))}
-        <Box flexDirection="row" gap={3}>
-          {back === undefined
-            ? []
-            : [<Button key="tab-back" plain label={`◂ ${short(back.title)}`} onPress={travel({ section: tab - 1, piece: 0 })} />]}
-          <Text dimColor>{`${tab + 1} of ${last + 1}`}</Text>
-          {on === undefined
-            ? []
-            : [<Button key="tab-next" plain label={`${short(on.title)} ▸`} onPress={travel({ section: tab + 1, piece: 0 })} />]}
-        </Box>
-      </Box>
-    )
-  }
-
-  const name = VARIANTS[variant] ?? 'Outline'
-  const switcher = (
-    <Box flexDirection="row" flexWrap="wrap" columnGap={1}>
-      <Button key="layout-back" plain label="◂" onPress={change(v => ({ ...v, variant: (variant + count - 1) % count }))} />
-      <Text inverse>{` layout ${variant + 1}/${count}: ${name} `}</Text>
-      <Button key="layout-next" plain label="▸" onPress={change(v => ({ ...v, variant: (variant + 1) % count }))} />
-      <Text dimColor>· align</Text>
-      <Button key="align-center" plain dimColor={left} label="center" onPress={change(v => ({ ...v, left: false }))} />
-      <Button key="align-left" plain dimColor={!left} label="left" onPress={change(v => ({ ...v, left: true }))} />
-      <Text dimColor>· prototype switcher</Text>
-    </Box>
-  )
+  const facts = [picture.title, act === undefined ? 'page as text' : 'live page', `${text.sections.length} sections`, 'prototype']
   const status: JSX.Element[] = []
   if (act !== undefined) status.push(<Button key="live-read" plain dimColor label="↻ read the page again" onPress={() => press({ kind: 'read' })} />)
   if (state.busy === true) status.push(<Text color="warning">… the page is working</Text>)
   else if (state.error) status.push(<Text color="error">{`✗ ${state.error}`}</Text>)
   else if (state.notice) status.push(<Text color="warning">{state.notice}</Text>)
-  // The page reads as a column at most READ_COLUMNS wide: in the middle of the
-  // chat, as its pictures sit, or at its left, as its own text does.
+  // The page reads as a column at most READ_COLUMNS wide, at the pane's left.
   return (
-    <Box flexDirection="column" alignItems={left ? 'flex-start' : 'center'} width="100%">
+    <Box flexDirection="column" paddingX={1}>
       <Box flexDirection="column" gap={1} width={wide}>
-        {switcher}
-        {status.length === 0 ? [] : [<Box flexDirection="row" flexWrap="wrap" columnGap={2}>{status}</Box>]}
-        {name === 'Outline' ? outline() : name === 'Document' ? linear() : tabs()}
+        <Box flexDirection="row" flexWrap="wrap" columnGap={2}>
+          <Text dimColor>{facts.join(' · ')}</Text>
+          {status}
+        </Box>
+        {text.intro.map((one, k) => piece(one, `intro-${k}`))}
+        {text.sections.map(section)}
+        <Box flexDirection="column" marginBottom={how.endRows}>
+          <Text dimColor>— end of the page —</Text>
+        </Box>
       </Box>
     </Box>
   )
-}
-
-/** The layout a row's view picks. */
-function layoutOf(view: PeekView): Layout {
-  const count = VARIANTS.length
-  return VARIANTS[((view.variant % count) + count) % count] ?? 'Outline'
 }
 
 /** PROTOTYPE (index): whether a page has the parts for the band above the prompt to index. */
@@ -976,49 +837,42 @@ export function isIndexed(text: PeekText): boolean {
   return text.sections.length > 1 || (text.sections[0]?.subs?.length ?? 0) > 1
 }
 
-/** PROTOTYPE (index): makes a row's page the one the band above the prompt indexes. */
-export function claimIndex($: EngineInterface, row: string, requestId: string): void {
-  void update($, navAtom, nav =>
-    nav !== null && nav.row === row && nav.requestId === requestId && nav.note === undefined ? nav : { row, requestId },
-  )
-}
-
 /**
- * PROTOTYPE (index): the band above the prompt while a page's row is unfolded:
- * a line of its sections, and under it the parts of the section the row is
- * at; each travels there on a click, a section also on its digit from the
- * empty prompt. The section the row is at is drawn bright, the others dim.
+ * PROTOTYPE (reader): the band above the prompt while the reader is open: a
+ * line of the page's sections, and under it the parts of the section the
+ * index went to last. A click scrolls the reader there; the wheel goes on
+ * from there. No hotkeys: a band button's digit fires from an empty prompt,
+ * so a message could not start with one.
  */
 export async function drawIndex(
   $: EngineInterface,
   e: RenderInput,
-  nav: PeekNav,
+  reader: PeekReader,
   picture: PeekPicture,
 ): Promise<JSX.Element | undefined> {
   const text = picture.text
   if (text === undefined || !isIndexed(text)) return undefined
   const { Box, Text, Button } = $.ui.resolve(e)
   const sections = text.sections
-  const state = await read($, memberOf(viewAtom, { requestId: nav.requestId }))
-  const start = startOf(state, text)
-  // The section the row is at: where travel made it start; in Tabs, the tab
-  // shown; the only one; else none.
-  const current =
-    start?.section ??
-    (layoutOf(state) === 'Tabs' || sections.length === 1 ? Math.min(Math.max(state.tab, 0), sections.length - 1) : undefined)
+  // The section the index went to last; with one section, that one.
+  const current = sections.length === 1 ? 0 : reader.at !== undefined && reader.at < sections.length ? reader.at : undefined
   const section = current === undefined ? undefined : sections[current]
   // Its parts: the headings right under its own.
   const subs = section?.subs ?? []
   const level = Math.min(...subs.map(sub => sub.level))
   const parts = subs.filter(sub => sub.level === level)
-  // What the last press came to: why the chat did not scroll, if it did not.
-  const said = (deny: string | undefined) =>
-    update($, navAtom, now => {
-      if (now === null || now.requestId !== nav.requestId) return now
-      if (deny === undefined) return now.note === undefined ? now : { row: now.row, requestId: now.requestId }
-      return { ...now, note: `could not scroll there: ${deny}` }
-    })
-  const go = (to?: PeekPlace) => () => void travelRow($, nav.requestId, to).then(said)
+  // Scrolls the reader to `to`, then notes the section gone to, and why the
+  // reader did not move, if it did not.
+  const go = (to: UiScrollTarget, at?: number) => () =>
+    void scrollReader($, to).then(deny =>
+      update($, readerAtom, now => {
+        if (now === null || now.row !== reader.row) return now
+        const next: PeekReader = { row: now.row }
+        if (at !== undefined) next.at = at
+        if (deny !== undefined) next.note = `could not scroll there: ${deny}`
+        return next
+      }),
+    )
   const partLine =
     section === undefined || current === undefined || parts.length === 0
       ? []
@@ -1026,13 +880,7 @@ export async function drawIndex(
           <Box flexDirection="row" flexWrap="wrap" columnGap={2}>
             <Text dimColor>{`› ${short(section.title)}:`}</Text>
             {parts.map((sub, k) => (
-              <Button
-                key={`part-${k}`}
-                plain
-                dimColor={start !== undefined && start.piece > 0 && start.piece !== sub.piece}
-                label={short(sub.title)}
-                onPress={go({ section: current, piece: sub.piece })}
-              />
+              <Button key={`index-part-${k}`} plain label={short(sub.title)} onPress={go({ key: partKey(current, sub.piece) }, current)} />
             ))}
           </Box>,
         ]
@@ -1044,56 +892,32 @@ export async function drawIndex(
           <Button
             key={`index-${at}`}
             plain
-            {...(at < 9 ? { hotkey: String(at + 1) } : {})}
             dimColor={current !== undefined && current !== at}
             label={short(each.title)}
-            onPress={go({ section: at, piece: 0 })}
+            onPress={go({ key: sectionKey(at) }, at)}
           />
         ))}
-        <Button key="index-top" plain dimColor label="▴ top" onPress={go()} />
-        {nav.note === undefined ? [] : [<Text color="warning">{nav.note}</Text>]}
+        <Button key="index-top" plain dimColor label="▴ top" onPress={go('start')} />
+        {reader.note === undefined ? [] : [<Text color="warning">{reader.note}</Text>]}
       </Box>
       {partLine}
     </Box>
   )
 }
 
-/**
- * PROTOTYPE (index): travels a row's page to a place: the row starts there,
- * what comes before it folded into one line, and the chat brings the row's
- * top to the top of the screen; with no place, the row shows all its page
- * again. The chat reveals whole rows: it cannot scroll to a heading inside one.
- * Resolves to why the chat did not scroll, if it did not.
- */
-async function travelRow($: EngineInterface, requestId: string, to?: PeekPlace): Promise<string | undefined> {
-  // The row's top stays where it is whatever the row then shows: scroll first.
-  const moved = scrollTop($, { requestId })
-  await update($, memberOf(viewAtom, { requestId }), v =>
-    to === undefined
-      ? withoutStart(v)
-      : { ...v, start: to, tab: to.section, open: v.open.includes(to.section) ? v.open : [...v.open, to.section] },
-  )
-  return moved
+/** PROTOTYPE (reader): the key of a section's box in the reader. */
+function sectionKey(at: number): string {
+  return `sec-${at}`
 }
 
-/** Where travel made a row start, while that is still a place in its page. */
-function startOf(view: PeekView, text: PeekText): PeekPlace | undefined {
-  const place = view.start
-  const section = place === undefined ? undefined : text.sections[place.section]
-  if (place === undefined || section === undefined) return undefined
-  return { section: place.section, piece: Math.min(Math.max(0, place.piece), Math.max(0, section.pieces.length - 1)) }
+/** PROTOTYPE (reader): the key of a part's box in the reader: section `at`, from its piece `piece`. */
+function partKey(at: number, piece: number): string {
+  return `part-${at}-${piece}`
 }
 
-/** A view with no start: the row shows all its page. */
-function withoutStart(view: PeekView): PeekView {
-  const next = { ...view }
-  delete next.start
-  return next
-}
-
-/** Brings `to` to the top of the screen; resolves to why not, if not. */
-function scrollTop($: EngineInterface, to: UiScrollTarget): Promise<string | undefined> {
-  return $.ui.scroll({ to, block: 'start' }).then(
+/** PROTOTYPE (reader): brings `to` to the top of the reader; resolves to why not, if not. */
+function scrollReader($: EngineInterface, to: UiScrollTarget): Promise<string | undefined> {
+  return $.ui.scroll({ in: READER_PANE, to, block: 'start' }).then(
     moved => moved.deny,
     (failure: unknown) => (failure instanceof Error ? failure.message : String(failure)),
   )
