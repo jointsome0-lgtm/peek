@@ -5,10 +5,12 @@
 // terminal's buttons, fields and lists, working in a page kept open.
 //
 // Question: does a page read well in the chat as text, and which layout feels
-// right: Outline (folded sections), Document (all of it) or Tabs (one section
-// at a time)? With --live: does using the page from the chat feel right?
+// right: Outline (folded sections, a bar to travel between them), Document
+// (all of it) or Tabs (one section at a time)? Centered or at the left? With
+// --live: does using the page from the chat feel right?
 //
-// Run: /peek <page.html> --text (or --live), unfold the row, flip layouts with ◂ and ▸.
+// Run: /peek <page.html> --text (or --live), unfold the row, flip layouts with
+// ◂ and ▸, and the column with center and left.
 // This file never merges; the decision lands on main, rewritten with tests.
 
 import { atom, memberOf, read, update } from 'claude-code'
@@ -21,6 +23,8 @@ import { fitCells } from './picture'
 const VARIANTS = ['Outline', 'Document', 'Tabs'] as const
 const viewAtom = atom({ plugin: 'peek', key: 'view' } as const, { variant: 0, open: [0], tab: 0 })
 const MAX_IMAGE = 255
+/** The widest the text runs, in columns: a column to read, centered or at the left. */
+const READ_COLUMNS = 100
 const LINKABLE = /^(https?|file):/i
 
 type Run = PeekRun
@@ -643,6 +647,12 @@ export async function drawText(
   const sections = text.sections
   const controls = text.controls ?? []
   const act = how.act
+  const left = state.left === true
+  const wide = Math.min(how.columns, READ_COLUMNS)
+  // Keys the chat scrolls to, the row's own: two rows may show one page.
+  const tag = tagOf(e.requestId)
+  const headKey = (at: number) => `fold-${at}-${tag}`
+  const contentsKey = `go-0-${tag}`
 
   // A press says the page is working, asks the page, then says what came of it.
   const press = (action: LiveAction) => {
@@ -660,11 +670,32 @@ export async function drawText(
     })()
   }
 
+  // Travel: brings a heading to the top of the screen, opening its section.
+  // The first scroll answers the press at once; the second lands it once open.
+  const travel = (key: string, open?: number) => () => {
+    const scroll = () =>
+      $.ui.scroll({ to: { key }, block: 'start' }).then(
+        moved => moved.deny,
+        (failure: unknown) => (failure instanceof Error ? failure.message : String(failure)),
+      )
+    const first = scroll()
+    void (async () => {
+      let deny = await first
+      if (open !== undefined && !state.open.includes(open)) {
+        await update($, view, v => (v.open.includes(open) ? v : { ...v, open: [...v.open, open] }))
+        const second = await scroll()
+        if (deny !== undefined) deny = second
+      }
+      const notice = deny === undefined ? '' : `could not scroll there: ${deny}`
+      await update($, view, v => (v.notice === notice ? v : { ...v, notice }))
+    })()
+  }
+
   const figure = (index: number, key: string): JSX.Element => {
     const shown = text.figures[index]
     if (how.drawsImage && shown?.file !== undefined && shown.width !== undefined && shown.height !== undefined) {
-      const wide = Math.max(10, Math.min(how.columns, MAX_IMAGE, Math.round(shown.share * how.columns)))
-      const size = fitCells(shown.width, shown.height, wide, MAX_IMAGE)
+      const most = Math.max(10, Math.min(wide, MAX_IMAGE, Math.round(shown.share * wide)))
+      const size = fitCells(shown.width, shown.height, most, MAX_IMAGE)
       return (
         <Image
           key={key}
@@ -747,17 +778,34 @@ export async function drawText(
     )
   const heading = (title: string, key: string) => <Markdown key={key} text={`## ${escapeMarkdown(title)}`} />
 
-  // Outline: the intro, then one folding row per section; the first starts open.
+  // Outline: the intro, a bar to travel to any section, then one folding row
+  // per section; the first starts open, and each open one ends in a way on.
+  const travels = sections.length > 1
   const outline = () => (
     <Box flexDirection="column">
       <Box flexDirection="column" gap={1} marginBottom={1}>
         {pieces(text.intro, 'intro')}
       </Box>
+      {!travels
+        ? []
+        : [
+            <Box flexDirection="row" flexWrap="wrap" columnGap={1} marginBottom={1}>
+              <Text dimColor>go to</Text>
+              {sections.map((s, at) => (
+                <Button
+                  key={`go-${at}-${tag}`}
+                  dimColor={!state.open.includes(at)}
+                  label={`${at + 1} ${short(s.title)}`}
+                  onPress={travel(headKey(at), at)}
+                />
+              ))}
+            </Box>,
+          ]}
       {sections.map((section, at) => {
         const isOpen = state.open.includes(at)
         const toggle = (
           <Button
-            key={`fold-${at}`}
+            key={headKey(at)}
             plain
             onPress={change(v => ({ ...v, open: v.open.includes(at) ? v.open.filter(k => k !== at) : [...v.open, at] }))}
           >
@@ -766,11 +814,27 @@ export async function drawText(
           </Button>
         )
         if (!isOpen) return toggle
+        const before = sections[at - 1]
+        const after = sections[at + 1]
+        const ways = !travels
+          ? []
+          : [
+              <Box flexDirection="row" flexWrap="wrap" columnGap={3}>
+                {before === undefined
+                  ? []
+                  : [<Button key={`back-${at}-${tag}`} plain dimColor label={`◂ ${short(before.title)}`} onPress={travel(headKey(at - 1), at - 1)} />]}
+                <Button key={`up-${at}-${tag}`} plain dimColor label="▴ go to" onPress={travel(contentsKey)} />
+                {after === undefined
+                  ? []
+                  : [<Button key={`next-${at}-${tag}`} plain label={`${short(after.title)} ▸`} onPress={travel(headKey(at + 1), at + 1)} />]}
+              </Box>,
+            ]
         return (
           <Box flexDirection="column">
             {toggle}
             <Box flexDirection="column" gap={1} paddingLeft={2} marginTop={1} marginBottom={1}>
               {pieces(section.pieces, `s${at}`)}
+              {ways}
             </Box>
           </Box>
         )
@@ -824,25 +888,30 @@ export async function drawText(
 
   const name = VARIANTS[variant] ?? 'Outline'
   const switcher = (
-    <Box flexDirection="row" gap={1}>
+    <Box flexDirection="row" flexWrap="wrap" columnGap={1}>
       <Button key="layout-back" plain label="◂" onPress={change(v => ({ ...v, variant: (variant + count - 1) % count }))} />
       <Text inverse>{` layout ${variant + 1}/${count}: ${name} `}</Text>
       <Button key="layout-next" plain label="▸" onPress={change(v => ({ ...v, variant: (variant + 1) % count }))} />
-      <Text dimColor>prototype switcher</Text>
+      <Text dimColor>· align</Text>
+      <Button key="align-center" plain dimColor={left} label="center" onPress={change(v => ({ ...v, left: false }))} />
+      <Button key="align-left" plain dimColor={!left} label="left" onPress={change(v => ({ ...v, left: true }))} />
+      <Text dimColor>· prototype switcher</Text>
     </Box>
   )
   const status: JSX.Element[] = []
-  if (act !== undefined) {
-    status.push(<Button key="live-read" plain dimColor label="↻ read the page again" onPress={() => press({ kind: 'read' })} />)
-    if (state.busy === true) status.push(<Text color="warning">… the page is working</Text>)
-    else if (state.error) status.push(<Text color="error">{`✗ ${state.error}`}</Text>)
-    else if (state.notice) status.push(<Text color="warning">{state.notice}</Text>)
-  }
+  if (act !== undefined) status.push(<Button key="live-read" plain dimColor label="↻ read the page again" onPress={() => press({ kind: 'read' })} />)
+  if (state.busy === true) status.push(<Text color="warning">… the page is working</Text>)
+  else if (state.error) status.push(<Text color="error">{`✗ ${state.error}`}</Text>)
+  else if (state.notice) status.push(<Text color="warning">{state.notice}</Text>)
+  // The page reads as a column at most READ_COLUMNS wide: in the middle of the
+  // chat, as its pictures sit, or at its left, as its own text does.
   return (
-    <Box flexDirection="column" gap={1}>
-      {switcher}
-      {status.length === 0 ? [] : [<Box flexDirection="row" gap={2}>{status}</Box>]}
-      {name === 'Outline' ? outline() : name === 'Document' ? linear() : tabs()}
+    <Box flexDirection="column" alignItems={left ? 'flex-start' : 'center'} width="100%">
+      <Box flexDirection="column" gap={1} width={wide}>
+        {switcher}
+        {status.length === 0 ? [] : [<Box flexDirection="row" flexWrap="wrap" columnGap={2}>{status}</Box>]}
+        {name === 'Outline' ? outline() : name === 'Document' ? linear() : tabs()}
+      </Box>
     </Box>
   )
 }
@@ -990,6 +1059,13 @@ function plainOf(runs: readonly Run[]): string {
     .join('')
     .replace(/\s+/g, ' ')
     .trim()
+}
+
+/** A short tag of a row's id, for keys that must be the row's own. */
+function tagOf(id: string): string {
+  let hash = 0
+  for (let at = 0; at < id.length; at++) hash = (Math.imul(hash, 31) + id.charCodeAt(at)) | 0
+  return (hash >>> 0).toString(36)
 }
 
 function short(title: string, most = 24): string {

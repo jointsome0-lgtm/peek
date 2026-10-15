@@ -105,10 +105,10 @@ export type PeekText = { intro: PeekPiece[]; sections: PeekSection[]; figures: P
 
 /**
  * PROTOTYPE (native-text): how a row shows its text: the layout picked, open
- * sections, the tab shown; for a live page, whether a press is under way and
- * what the last one said.
+ * sections, the tab shown, whether the text sits at the chat's left rather
+ * than in its middle; whether a press is under way and what the last one said.
  */
-export type PeekView = { variant: number; open: number[]; tab: number; busy?: boolean; error?: string; notice?: string }
+export type PeekView = { variant: number; open: number[]; tab: number; left?: boolean; busy?: boolean; error?: string; notice?: string }
 
 declare module 'claude-code' {
   interface PluginState {
