@@ -1,0 +1,23 @@
+{
+  "name": "peek",
+  "version": "0.2.0",
+  "description": "Pictures and HTML page snapshots as foldable rows in the chat: full color in kitty and Ghostty, colored half blocks in other terminals",
+  "author": {
+    "name": "Агнив Банерджи"
+  },
+  "license": "MIT",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "mode": {
+      "type": "string",
+      "title": "Picture mode",
+      "description": "auto picks by terminal; image draws full color (kitty, Ghostty); blocks draws colored half blocks (any terminal)",
+      "default": "auto",
+      "options": [
+        "auto",
+        "image",
+        "blocks"
+      ]
+    }
+  }
+}

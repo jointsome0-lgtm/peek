@@ -1,0 +1,13 @@
+{
+  "name": "peek",
+  "description": "peek: pictures and HTML pages in the Claude Code chat",
+  "owner": {
+    "name": "Агнив Банерджи"
+  },
+  "plugins": [
+    {
+      "name": "peek",
+      "source": "./"
+    }
+  ]
+}
