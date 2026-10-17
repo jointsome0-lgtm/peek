@@ -89,3 +89,9 @@ claude plugin validate /path/to/peek
 claude plugin test /path/to/peek
 tsc -p /path/to/peek    # once the engine has written .claude-plugin/types/
 ```
+
+Road B is tried on the branch `prototype/native-text`, checked out in
+`.worktrees/native-text`. For the trial, the dev-mods link of session
+60f1e3b4, `~/.claude/dev-mods/60f1e3b4-7dcd-4bfb-87c3-d18b99e1dd3f/peek`,
+points at that worktree. Once the owner picks a layout, capture it as the
+prototype skill says and point the link back to the main checkout.
